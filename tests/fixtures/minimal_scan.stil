@@ -1,0 +1,86 @@
+STIL 1.0 { Design 2005; }
+Signals {
+  "CSN" In; "SDI" In { ScanIn; } "SCLK" In; "AUX" In; "SDOB" Out { ScanOut; }
+}
+SignalGroups {
+  "all_inputs" = '"CSN" + "SDI" + "SCLK" + "AUX"';
+  "all_outputs" = '"SDOB"' { ScanOut; }
+  "_pi" = '"all_inputs"';
+  "_po" = '"all_outputs"' { ScanOut; }
+  "_clk" = '"SCLK" + "CSN"';
+  "_si" = '"SDI"' { ScanIn; }
+  "_so" = '"SDOB"' { ScanOut; }
+}
+Timing {
+  WaveformTable "default_WFT" {
+    Period '100ns';
+    Waveforms {
+      "all_inputs" { 0 { '0ns' D; } }
+      "all_inputs" { 1 { '0ns' U; } }
+      "all_outputs" { X { '0ns' X; '40ns' X; } }
+      "all_outputs" { H { '0ns' X; '40ns' H; } }
+      "all_outputs" { L { '0ns' X; '40ns' L; } }
+      "CSN" { P { '0ns' U; '45ns' D; '75ns' U; } }
+      "SCLK" { P { '0ns' D; '45ns' U; '75ns' D; } }
+    }
+  }
+  WaveformTable "capture_WFT" {
+    Period '100ns';
+    Waveforms {
+      "all_inputs" { 0 { '0ns' D; } }
+      "all_inputs" { 1 { '0ns' U; } }
+      "all_outputs" { X { '0ns' X; '40ns' X; } }
+      "all_outputs" { H { '0ns' X; '40ns' H; } }
+      "all_outputs" { L { '0ns' X; '40ns' L; } }
+      "CSN" { P { '0ns' U; '45ns' D; '75ns' U; } }
+      "SCLK" { P { '0ns' D; '45ns' U; '75ns' D; } }
+    }
+  }
+}
+ScanStructures {
+  ScanChain "1" {
+    ScanLength 4;
+    ScanIn "SDI";
+    ScanOut "SDOB";
+  }
+}
+Procedures {
+  "capture" {
+    W "capture_WFT";
+    C { "_po"=X; }
+    V { "_pi"=####; }
+    V { }
+    V { "_po"=#; }
+    C { "_po"=X; }
+    V { "_clk"=##; }
+  }
+  "load_unload" {
+    W "default_WFT";
+    C { "all_inputs"=1000; "all_outputs"=X; }
+    V { "AUX"=1; }
+    Shift {
+      W "default_WFT";
+      V { "_clk"=P1; "_si"=#; "_so"=#; }
+    }
+  }
+}
+MacroDefs {
+  "setup" {
+    W "default_WFT";
+    C { "all_inputs"=1000; "all_outputs"=X; }
+    V { "SCLK"=0; }
+    V { "SCLK"=P; }
+  }
+}
+PatternBurst "burst" { PatList { "main" { } } }
+PatternExec { PatternBurst "burst"; }
+Pattern "main" {
+  W "capture_WFT";
+  C { "_pi"=0000; "_po"=X; }
+  Macro "setup";
+  "pattern 0": Call "load_unload" { "SDI"=0101; }
+  Call "capture" { "_pi"=1000; "_po"=L; "_clk"=P1; }
+  Call "capture" { "_pi"=1000; "_po"=H; "_clk"=0P; }
+  "end unload": Call "load_unload" { "SDOB"=LHXL; }
+}
+// Patterns reference 14 V statements, generating 20 test cycles
