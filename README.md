@@ -13,7 +13,7 @@ pattern generation and migration, while `.digipat` is the compiled pattern used
 by NI-Digital. See [NI's migration overview](https://www.ni.com/en/shop/electronic-test-instrumentation/digital-instruments/what-are-digital-pattern-instruments/important-considerations-when-migrating-to-the-digital-pattern-i.html).
 
 > [!IMPORTANT]
-> This project is **not a complete IEEE 1450 parser**. Version 0.1 targets the
+> This project is **not a complete IEEE 1450 parser**. Version 0.2 targets the
 > common flat, scan-oriented STIL subset emitted by Synopsys TetraMAX. It fails
 > on unsupported constructs rather than silently changing pattern semantics.
 
@@ -26,8 +26,30 @@ by NI-Digital. See [NI's migration overview](https://www.ni.com/en/shop/electron
 - Keeps long scan data compact with NI `scan()` blocks.
 - `--expand-scan` emits one ordinary NI vector statement per test cycle.
 - Verifies the generated cycle count against the TetraMAX summary when present.
-- Uses only the Python standard library.
+- Provides a Windows desktop app with file selection, drag-and-drop, progress,
+  and conversion logs.
+- The command-line converter uses only the Python standard library.
 - Can invoke `DigitalPatternCompiler.exe` and produce `.digipat` files.
+
+## Windows desktop app
+
+Download `STIL-to-NI-Digital.exe` from the
+[latest release](https://github.com/dong7727/stil-to-ni-digital/releases/latest).
+No Python installation is required.
+
+1. Double-click `STIL-to-NI-Digital.exe`.
+2. Drag a `.stil` or `.stil.gz` file into the window, or click **Browse**.
+3. Choose an output directory.
+4. Keep **fully expand scan cycles** selected when every test cycle must be an
+   ordinary one-line vector. Clear it for a much smaller `scan()`-based source.
+5. Select NI compilation when Digital Pattern Compiler is installed, then click
+   **Start conversion**.
+
+You can also drag a STIL file onto the executable icon to preselect it when the
+app opens.
+
+The release executable is not code-signed, so Windows SmartScreen may display a
+warning. Verify the published SHA-256 checksum before running it.
 
 ## Install
 
@@ -89,7 +111,7 @@ STIL H/L/X output     -> NI H/L/X with CompareStrobe
 A STIL shift such as a 3,013-bit scan operation becomes either one compact
 `scan(3013)` block or 3,013 ordinary vector statements with `--expand-scan`.
 
-## Supported subset in 0.1
+## Supported STIL subset
 
 - `Signals` with scalar `In`, `Out`, and `InOut` pins
 - ordered `SignalGroups` using `+`
@@ -127,6 +149,17 @@ The NI compiler is proprietary and is not included in this repository. The
 project's CI validates conversion structure and cycle preservation using
 synthetic fixtures. Hardware and compiler validation must be performed in an NI
 development environment.
+
+## Build the Windows app
+
+Create a Windows virtual environment with Python 3.10 or later, then run:
+
+```powershell
+python -m pip install ".[gui]" pyinstaller
+.\scripts\build_windows.ps1
+```
+
+The executable is written to `packaging/dist/STIL-to-NI-Digital.exe`.
 
 ## License
 

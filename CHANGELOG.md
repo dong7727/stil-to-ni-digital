@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0 - 2026-09-04
+
+- Add a Windows desktop interface with file selection and drag-and-drop input.
+- Run conversion in a background thread with status and log output.
+- Detect the NI Digital Pattern Compiler and optionally create `.digipat` files.
+- Add a reproducible PyInstaller build and packaged-executable smoke test.
+
 ## 0.1.0 - 2026-09-04
 
 - Initial open-source release.

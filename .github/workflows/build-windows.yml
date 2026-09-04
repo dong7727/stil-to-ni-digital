@@ -1,0 +1,36 @@
+name: build-windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  executable:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ".[gui]" pyinstaller
+      - name: Build executable
+        working-directory: packaging
+        run: python -m PyInstaller --noconfirm --clean stil-to-ni-digital.spec
+      - name: Smoke test executable
+        run: .\packaging\dist\STIL-to-NI-Digital.exe --self-test
+      - name: Create checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 .\packaging\dist\STIL-to-NI-Digital.exe).Hash
+          Set-Content -Path .\packaging\dist\SHA256SUMS.txt -Value "$hash  STIL-to-NI-Digital.exe" -Encoding ascii
+      - uses: actions/upload-artifact@v7
+        with:
+          name: STIL-to-NI-Digital-Windows
+          path: |
+            packaging/dist/STIL-to-NI-Digital.exe
+            packaging/dist/SHA256SUMS.txt
+          if-no-files-found: error
