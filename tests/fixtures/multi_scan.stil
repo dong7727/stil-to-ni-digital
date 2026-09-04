@@ -1,0 +1,70 @@
+STIL 1.0 { Design 2005; }
+Signals {
+  "CLK" In; "CAP" In; "SI0" In { ScanIn; } "SI1" In { ScanIn; }
+  "AUX" In; "SO0" Out { ScanOut; } "SO1" Out { ScanOut; }
+}
+SignalGroups {
+  "all_inputs" = '"CLK" + "CAP" + "SI0" + "SI1" + "AUX"';
+  "all_outputs" = '"SO0" + "SO1"' { ScanOut; }
+  "_pi" = '"all_inputs"';
+  "_po" = '"all_outputs"' { ScanOut; }
+  "_si" = '"SI0" + "SI1"' { ScanIn; }
+  "_so" = '"SO0" + "SO1"' { ScanOut; }
+}
+Timing {
+  WaveformTable "default_WFT" {
+    Period '100ns';
+    Waveforms {
+      "all_inputs" { 0 { '0ns' D; } }
+      "all_inputs" { 1 { '0ns' U; } }
+      "all_outputs" { X { '0ns' X; '40ns' X; } }
+      "all_outputs" { H { '0ns' X; '40ns' H; } }
+      "all_outputs" { L { '0ns' X; '40ns' L; } }
+      "all_outputs" { T { '0ns' X; '40ns' T; } }
+      "CLK" { P { '0ns' D; '45ns' U; '75ns' D; } }
+    }
+  }
+}
+ScanStructures {
+  ScanChain "A" {
+    ScanLength 4;
+    ScanIn "SI0";
+    ScanOut "SO0";
+    ScanInversion 0;
+    ScanMasterClock "CLK";
+  }
+  ScanChain "B" {
+    ScanLength 3;
+    ScanIn "SI1";
+    ScanOut "SO1";
+    ScanInversion 1;
+    ScanMasterClock "CLK";
+  }
+}
+Procedures {
+  "load_unload" {
+    W "default_WFT";
+    C { "all_inputs"=\r5 0; "all_outputs"=\r2 X; }
+    F { "AUX"=1; }
+    V { "AUX"=1; }
+    Shift {
+      W "default_WFT";
+      V { "CLK"=P; "_si"=##; "_so"=##; }
+    }
+  }
+  "capture_valid" {
+    W "default_WFT";
+    V { "_po"=\j \r2 T; }
+  }
+}
+Pattern "multi" {
+  W "default_WFT";
+  C { "_pi"=\j \r5 0; "_po"=\r2 X; }
+  "load": Call "load_unload" { "SI0"=0101; "SI1"=101; }
+  Call "capture_valid" { }
+  "middle": Call "load_unload" {
+    "SO0"=HLXH; "SO1"=LHL; "SI0"=1100; "SI1"=010;
+  }
+  "unload": Call "load_unload" { "SO0"=LHLX; "SO1"=HLH; }
+}
+// Patterns reference 7 V statements, generating 16 test cycles

@@ -58,6 +58,32 @@ class ScanOp:
         return self.count
 
 
+@dataclass(frozen=True)
+class ScanChain:
+    name: str
+    length: int
+    scan_in: str
+    scan_out: str
+    inversion: int = 0
+    master_clock: str | None = None
+
+
+@dataclass(frozen=True)
+class PinInfo:
+    name: str
+    direction: str
+    required: bool
+    roles: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class StilInspection:
+    source: Path
+    pins: tuple[PinInfo, ...]
+    scan_chains: tuple[ScanChain, ...]
+    waveform_tables: tuple[str, ...]
+
+
 @dataclass
 class DefinitionEvent:
     kind: str
@@ -75,9 +101,8 @@ class Model:
     periods_ns: dict[str, float] = field(default_factory=dict)
     compare_ns: float = 40.0
     pulse_edges: dict[str, tuple[str, float, float]] = field(default_factory=dict)
-    scan_length: int = 0
-    scan_in: str = ""
-    scan_out: str = ""
+    scan_chains: list[ScanChain] = field(default_factory=list)
+    omitted_pins: list[str] = field(default_factory=list)
     procedures: dict[str, list[DefinitionEvent]] = field(default_factory=dict)
     macros: dict[str, list[DefinitionEvent]] = field(default_factory=dict)
     ops: list[VectorOp | ScanOp] = field(default_factory=list)
@@ -144,9 +169,23 @@ def _named_blocks(section_body: str) -> dict[str, str]:
     return result
 
 
+def _expand_assignment(value: str) -> str:
+    """Expand the TetraMAX compact WFC notation used in STIL assignments."""
+    value = re.sub(r"\\j\b", "", value)
+
+    def expand_repeat(match: re.Match[str]) -> str:
+        return match.group(2) * int(match.group(1))
+
+    value = re.sub(r"\\r\s*(\d+)\s+([^\s])", expand_repeat, value)
+    value = re.sub(r"\s+", "", value)
+    if "\\" in value:
+        raise ConversionError(f"unsupported compact WFC expression {value!r}")
+    return value
+
+
 def _assignments(body: str) -> dict[str, str]:
     return {
-        name: re.sub(r"\s+", "", value)
+        name: _expand_assignment(value)
         for name, value in re.findall(r'"([^"]+)"\s*=\s*([^;]+);', body, re.DOTALL)
     }
 
@@ -254,20 +293,56 @@ def _parse_timing(text: str, model: Model) -> None:
 
 def _parse_scan(text: str, model: Model) -> None:
     block = _extract_block(text, r"^ScanStructures\s*\{")
-    lengths = re.findall(r"ScanLength\s+(\d+)\s*;", block)
-    inputs = re.findall(r'ScanIn\s+"([^"]+)"\s*;', block)
-    outputs = re.findall(r'ScanOut\s+"([^"]+)"\s*;', block)
-    if len(lengths) != 1 or len(inputs) != 1 or len(outputs) != 1:
-        raise ConversionError("exactly one scan chain is currently supported")
-    model.scan_length = int(lengths[0])
-    model.scan_in = inputs[0]
-    model.scan_out = outputs[0]
+    pos = 0
+    header = re.compile(r'ScanChain\s+"([^"]+)"\s*\{')
+    while match := header.search(block, pos):
+        open_pos = block.find("{", match.start(), match.end())
+        end = _balanced_end(block, open_pos)
+        body = block[open_pos + 1 : end]
+        length = re.findall(r"ScanLength\s+(\d+)\s*;", body)
+        scan_in = re.findall(r'ScanIn\s+"([^"]+)"\s*;', body)
+        scan_out = re.findall(r'ScanOut\s+"([^"]+)"\s*;', body)
+        if len(length) != 1 or len(scan_in) != 1 or len(scan_out) != 1:
+            raise ConversionError(f"scan chain {match.group(1)!r} needs one length, input, and output")
+        inversion_match = re.search(r"ScanInversion\s+(\d+)\s*;", body)
+        master_match = re.search(r'ScanMasterClock\s+"([^"]+)"\s*;', body)
+        chain = ScanChain(
+            name=match.group(1),
+            length=int(length[0]),
+            scan_in=scan_in[0],
+            scan_out=scan_out[0],
+            inversion=int(inversion_match.group(1)) if inversion_match else 0,
+            master_clock=master_match.group(1) if master_match else None,
+        )
+        if chain.length < 1:
+            raise ConversionError(f"scan chain {chain.name!r} has an invalid length")
+        for pin in (chain.scan_in, chain.scan_out):
+            if pin not in model.pins:
+                raise ConversionError(f"scan chain {chain.name!r} references unknown pin {pin!r}")
+        if chain.master_clock and chain.master_clock not in model.pins:
+            raise ConversionError(
+                f"scan chain {chain.name!r} references unknown master clock {chain.master_clock!r}"
+            )
+        model.scan_chains.append(chain)
+        pos = end + 1
+
+    if not model.scan_chains:
+        raise ConversionError("no scan chains found")
+    scan_inputs = [chain.scan_in for chain in model.scan_chains]
+    scan_outputs = [chain.scan_out for chain in model.scan_chains]
+    if len(set(scan_inputs)) != len(scan_inputs):
+        raise ConversionError("each scan chain must have a unique ScanIn pin")
+    if len(set(scan_outputs)) != len(scan_outputs):
+        raise ConversionError("each scan chain must have a unique ScanOut pin")
+    overlap = set(scan_inputs) & set(scan_outputs)
+    if overlap:
+        raise ConversionError(f"pins cannot be both ScanIn and ScanOut: {sorted(overlap)}")
 
 
 def _definition_events(body: str) -> list[DefinitionEvent]:
     events: list[DefinitionEvent] = []
     pos = 0
-    token_re = re.compile(r"\b(W|C|V|Shift)\b")
+    token_re = re.compile(r"\b(W|C|F|V|Shift)\b")
     while match := token_re.search(body, pos):
         kind = match.group(1)
         if kind == "W":
@@ -359,8 +434,8 @@ def _map_vector(model: Model, state: dict[str, str]) -> tuple[str, list[str]]:
         elif symbol in "ZN":
             symbol = "X"
         elif symbol == "T":
-            raise ConversionError("STIL compare symbol T is not supported")
-        elif symbol not in "01HLX":
+            symbol = "V"
+        elif symbol not in "01HLXV":
             raise ConversionError(f"unsupported vector symbol {symbol!r} on {pin!r}")
         values.append(symbol)
     return _timeset_name(model, state["__wft__"], pulse_pins), values
@@ -381,7 +456,7 @@ def _execute_shift(
     for event in events:
         if event.kind == "W":
             state["__wft__"] = str(event.payload)
-        elif event.kind == "C":
+        elif event.kind in {"C", "F"}:
             _apply(model, state, event.payload, params)  # type: ignore[arg-type]
         elif event.kind == "V":
             if vector_assignments is not None:
@@ -392,7 +467,11 @@ def _execute_shift(
     if vector_assignments is None:
         raise ConversionError("Shift contains no vector")
 
-    scan_pins = {model.scan_in, model.scan_out}
+    scan_pins = {
+        pin
+        for chain in model.scan_chains
+        for pin in (chain.scan_in, chain.scan_out)
+    }
     for target, template in vector_assignments.items():
         pins = _target_pins(model, target)
         if len(template) != len(pins):
@@ -410,30 +489,47 @@ def _execute_shift(
                     symbol = state[pin]
             state[pin] = symbol
 
-    scan_in = params.get(model.scan_in, state[model.scan_in] * model.scan_length)
-    scan_out = params.get(model.scan_out, state[model.scan_out] * model.scan_length)
-    if len(scan_in) != model.scan_length or len(scan_out) != model.scan_length:
-        raise ConversionError(
-            f"scan strings must both contain {model.scan_length} symbols "
-            f"({model.scan_in}={len(scan_in)}, {model.scan_out}={len(scan_out)})"
-        )
-    if set(scan_in) - set("01"):
-        raise ConversionError(f"unsupported scan-in symbols: {sorted(set(scan_in) - set('01'))}")
-    if set(scan_out) - set("HLX"):
-        raise ConversionError(f"unsupported scan-out symbols: {sorted(set(scan_out) - set('HLX'))}")
-
     timeset, values = _map_vector(model, state)
-    values[model.pins.index(model.scan_in)] = "_"
-    values[model.pins.index(model.scan_out)] = "_"
+    scan_count = max(chain.length for chain in model.scan_chains)
+    sequences: dict[str, str] = {}
+    for chain in model.scan_chains:
+        default_scan_in = state[chain.scan_in] if state[chain.scan_in] in "01" else "0"
+        scan_in = params.get(chain.scan_in, default_scan_in * chain.length)
+        scan_out = params.get(chain.scan_out, state[chain.scan_out] * chain.length)
+        scan_out = scan_out.translate(str.maketrans({"Z": "X", "N": "X"}))
+        if len(scan_in) != chain.length or len(scan_out) != chain.length:
+            raise ConversionError(
+                f"scan strings for chain {chain.name!r} must contain {chain.length} symbols "
+                f"({chain.scan_in}={len(scan_in)}, {chain.scan_out}={len(scan_out)})"
+            )
+        if set(scan_in) - set("01"):
+            raise ConversionError(
+                f"unsupported scan-in symbols on {chain.scan_in!r}: "
+                f"{sorted(set(scan_in) - set('01'))}"
+            )
+        if set(scan_out) - set("HLX"):
+            raise ConversionError(
+                f"unsupported scan-out symbols on {chain.scan_out!r}: "
+                f"{sorted(set(scan_out) - set('HLX'))}"
+            )
+
+        padding = scan_count - chain.length
+        # An early ScanIn filler is shifted out after the meaningful data.  A
+        # trailing ScanOut X disables comparison after a shorter chain ends.
+        sequences[chain.scan_in] = scan_in[0] * padding + scan_in
+        sequences[chain.scan_out] = scan_out + "X" * padding
+        values[model.pins.index(chain.scan_in)] = "_"
+        values[model.pins.index(chain.scan_out)] = "_"
+        state[chain.scan_in] = scan_in[-1]
+
     model.ops.append(
         ScanOp(
             timeset,
-            model.scan_length,
+            scan_count,
             values,
-            {model.scan_in: scan_in, model.scan_out: scan_out},
+            sequences,
         )
     )
-    state[model.scan_in] = scan_in[-1]
 
 
 def _execute_definition(
@@ -446,7 +542,7 @@ def _execute_definition(
     for event in events:
         if event.kind == "W":
             state["__wft__"] = str(event.payload)
-        elif event.kind in {"C", "V"}:
+        elif event.kind in {"C", "F", "V"}:
             _apply(model, state, event.payload, params)  # type: ignore[arg-type]
             if event.kind == "V":
                 _emit_vector(model, state)
@@ -465,7 +561,7 @@ def _parse_pattern(text: str, model: Model, keep_labels: bool) -> None:
     state["__wft__"] = model.waveform_tables[0]
 
     pos = 0
-    token_re = re.compile(r"\b(W|C|V|Macro|Call)\b")
+    token_re = re.compile(r"\b(W|C|F|V|Macro|Call)\b")
     labels: set[str] = set()
     while token := token_re.search(body, pos):
         kind = token.group(1)
@@ -476,7 +572,7 @@ def _parse_pattern(text: str, model: Model, keep_labels: bool) -> None:
             state["__wft__"] = statement.group(1)
             pos = token.start() + statement.end()
             continue
-        if kind in {"C", "V"}:
+        if kind in {"C", "F", "V"}:
             open_block = body.find("{", token.end())
             end = _balanced_end(body, open_block)
             _apply(model, state, _assignments(body[open_block + 1 : end]))
@@ -556,12 +652,52 @@ def _collect_timesets(model: Model) -> None:
             seen.add(op.timeset)
 
 
+def _required_pin_roles(model: Model) -> dict[str, list[str]]:
+    roles: dict[str, list[str]] = {}
+    for chain in model.scan_chains:
+        roles.setdefault(chain.scan_in, []).append(f"ScanIn: {chain.name}")
+        roles.setdefault(chain.scan_out, []).append(f"ScanOut: {chain.name}")
+        if chain.master_clock:
+            roles.setdefault(chain.master_clock, []).append(f"ScanClock: {chain.name}")
+    for pin in model.pulse_edges:
+        roles.setdefault(pin, []).append("P waveform")
+    return roles
+
+
+def _select_pins(model: Model, selected_pins: Iterable[str] | None) -> None:
+    if selected_pins is None:
+        return
+    requested = set(selected_pins)
+    if not requested:
+        raise ConversionError("at least one output pin must be selected")
+    unknown = requested - set(model.pins)
+    if unknown:
+        raise ConversionError(f"selected pins do not exist in STIL: {sorted(unknown)}")
+    required = set(_required_pin_roles(model))
+    missing = required - requested
+    if missing:
+        raise ConversionError(f"required scan/clock pins cannot be omitted: {sorted(missing)}")
+
+    original_pins = model.pins[:]
+    indexes = [index for index, pin in enumerate(original_pins) if pin in requested]
+    model.pins = [original_pins[index] for index in indexes]
+    model.omitted_pins = [pin for pin in original_pins if pin not in requested]
+    model.directions = {pin: model.directions[pin] for pin in model.pins}
+    model.pulse_edges = {pin: edge for pin, edge in model.pulse_edges.items() if pin in requested}
+    for op in model.ops:
+        if isinstance(op, ScanOp):
+            op.base_values[:] = [op.base_values[index] for index in indexes]
+        else:
+            op.values[:] = [op.values[index] for index in indexes]
+
+
 def _write_pattern(model: Model, path: Path) -> None:
     with path.open("w", encoding="utf-8", newline="\n") as out:
         out.write("// Generated by stil-to-ni-digital.\n")
         out.write("file_format_version 1.1;\n")
         out.write(f"timeset {', '.join(model.used_timesets)};\n")
-        out.write(f"scan_in {model.scan_in};\nscan_out {model.scan_out};\n\n")
+        out.write(f"scan_in {', '.join(chain.scan_in for chain in model.scan_chains)};\n")
+        out.write(f"scan_out {', '.join(chain.scan_out for chain in model.scan_chains)};\n\n")
         out.write(f"pattern {model.pattern_name} ({', '.join(model.pins)})\n{{\n")
         for op in model.ops:
             if op.label:
@@ -571,7 +707,9 @@ def _write_pattern(model: Model, path: Path) -> None:
                 out.write(f"{prefix}{op.timeset} {' '.join(op.values)};\n")
             else:
                 out.write(f"scan({op.count}) {op.timeset} {' '.join(op.base_values)};\n{{\n")
-                for pin in (model.scan_in, model.scan_out):
+                scan_pins = [chain.scan_in for chain in model.scan_chains]
+                scan_pins += [chain.scan_out for chain in model.scan_chains]
+                for pin in scan_pins:
                     out.write(f"  {pin} {op.sequences[pin]};\n")
                 out.write("};\n")
         out.write("}\n")
@@ -677,7 +815,14 @@ def _write_report(model: Model, files: dict[str, Path], path: Path) -> None:
         f"Source: {model.source}", f"Source SHA-256: {_sha256(model.source)}", "",
         f"Pins: {', '.join(f'{pin} ({model.directions[pin]})' for pin in model.pins)}",
         f"Waveform tables: {', '.join(model.waveform_tables)}",
-        f"Scan chain: {model.scan_in} -> {model.scan_out}, length {model.scan_length}",
+        f"Selected pins: {', '.join(model.pins)}",
+        f"Omitted pins: {', '.join(model.omitted_pins) if model.omitted_pins else '(none)'}",
+        "Scan chains:",
+        *[
+            f"- {chain.name}: {chain.scan_in} -> {chain.scan_out}, length {chain.length}, "
+            f"inversion {chain.inversion}, master clock {chain.master_clock or '(not declared)'}"
+            for chain in model.scan_chains
+        ],
         f"Generated test cycles: {cycles}",
         f"Source-reported test cycles: {model.expected_cycles}",
         f"NI vector instructions: {sum(isinstance(op, VectorOp) for op in model.ops)}",
@@ -693,12 +838,40 @@ def _write_report(model: Model, files: dict[str, Path], path: Path) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
+def inspect_file(source: Path) -> StilInspection:
+    source = source.expanduser().resolve()
+    if not source.is_file():
+        raise ConversionError(f"input file does not exist: {source}")
+    text = _read_text(source)
+    model = Model(source, source.parent)
+    _parse_signals_groups(text, model)
+    _parse_timing(text, model)
+    _parse_scan(text, model)
+    roles = _required_pin_roles(model)
+    pins = tuple(
+        PinInfo(
+            name=pin,
+            direction=model.directions[pin],
+            required=pin in roles,
+            roles=tuple(dict.fromkeys(roles.get(pin, ()))),
+        )
+        for pin in model.pins
+    )
+    return StilInspection(
+        source=source,
+        pins=pins,
+        scan_chains=tuple(model.scan_chains),
+        waveform_tables=tuple(model.waveform_tables),
+    )
+
+
 def convert_file(
     source: Path,
     output_dir: Path,
     *,
     expand_scan: bool = False,
     keep_labels: bool = True,
+    selected_pins: Iterable[str] | None = None,
 ) -> ConversionResult:
     source = source.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
@@ -720,6 +893,7 @@ def convert_file(
     _finish_with_halt(model)
     if sum(op.cycles for op in model.ops) != cycles:
         raise AssertionError("halt conversion changed the cycle count")
+    _select_pins(model, selected_pins)
     _collect_timesets(model)
 
     output_dir.mkdir(parents=True, exist_ok=True)

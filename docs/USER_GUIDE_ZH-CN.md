@@ -1,6 +1,6 @@
 # STIL to NI-Digital 中文使用手册
 
-本文档适用于 `STIL to NI-Digital v0.2.1`。软件用于将常见的、面向扫描测试的 Synopsys TetraMAX STIL 文件转换为 NI Digital Pattern Editor / NI PXI Digital Pattern Instrument 可继续处理的文件。
+本文档适用于 `STIL to NI-Digital v0.3.0`。软件用于将常见的、面向扫描测试的 Synopsys TetraMAX STIL 文件转换为 NI Digital Pattern Editor / NI PXI Digital Pattern Instrument 可继续处理的文件。
 
 > [!IMPORTANT]
 > 本工具不是完整的 IEEE 1450 STIL 解析器。它只转换项目明确支持的 STIL 子集；遇到无法可靠转换的结构时会停止并报错，不会故意静默改变测试语义。
@@ -43,13 +43,7 @@ SHA256SUMS.txt
 Get-FileHash .\STIL-to-NI-Digital.exe -Algorithm SHA256
 ```
 
-v0.2.1 的正确 SHA-256 为：
-
-```text
-926996F8DE7DAA635566451006A1947E26F7C090E823E083819E0127647249A2
-```
-
-计算结果也应与同一 Release 中的 `SHA256SUMS.txt` 一致。其他版本必须以对应 Release 附带的校验文件为准。
+计算结果应与同一 Release 中的 `SHA256SUMS.txt` 一致。每个版本的 EXE 都不同，必须使用对应 Release 附带的校验文件。
 
 ### 2.3 Windows SmartScreen 提示
 
@@ -89,7 +83,27 @@ D:\patterns\device_scan.stil
 D:\patterns\device_scan_NI_Output
 ```
 
-### 3.2 选择输出目录
+### 3.2 解析并选择引脚
+
+选中文件后，程序会在后台自动解析 `Signals`、Timing 和所有 `ScanChain`，然后显示：
+
+- STIL 中的全部引脚
+- 每个引脚的 `In`、`Out` 或 `InOut` 方向
+- ScanIn、ScanOut、ScanClock 和 `P` waveform 角色
+- 扫描链数量、每条链的输入、输出和长度
+
+所有引脚默认勾选。普通引脚可以自由取消；以下引脚属于 Pattern 正确执行所必需，界面会保持勾选：
+
+- 每条扫描链的 ScanIn
+- 每条扫描链的 ScanOut
+- `ScanMasterClock`
+- Timing 中使用 `P` 脉冲波形的引脚
+
+“全选”恢复全部引脚；“仅保留必选”取消所有普通引脚。取消普通控制脚会改变 Pattern 在硬件上的行为，请只排除确定不需要连接或观察的引脚。
+
+如果手工修改了输入路径，必须点击“解析引脚”重新解析，之后才能转换。
+
+### 3.3 选择输出目录
 
 可以直接使用自动建议的目录，也可以点击“输出目录…”选择其他文件夹。
 
@@ -97,7 +111,7 @@ D:\patterns\device_scan_NI_Output
 
 建议每个 STIL 文件使用独立的空目录，便于核对结果和保存转换记录。
 
-### 3.3 设置转换选项
+### 3.4 设置转换选项
 
 #### 完全展开扫描周期
 
@@ -126,20 +140,21 @@ D:\patterns\device_scan_NI_Output
 
 如果此选项呈灰色，表示程序没有在系统 `PATH` 或常见 NI 安装目录中找到 `DigitalPatternCompiler.exe`。这不影响生成 `.digipatsrc`、`.digitiming` 和 `.pinmap`。
 
-### 3.4 开始转换
+### 3.5 开始转换
 
 点击“开始转换”后：
 
 1. 程序检查输入文件和输出目录。
-2. 解析 STIL 中的引脚、SignalGroups、WaveformTables、ScanStructures、Procedures、MacroDefs 和 Pattern。
-3. 计算并核对测试周期数。
-4. 生成 NI Pattern Source、Timing、Pin Map 和转换报告。
-5. 如果勾选完全展开，逐周期生成展开版 Pattern。
-6. 如果勾选 NI 编译，再调用 NI 编译器生成 `.digipat`。
+2. 按已勾选的引脚准备输出，同时保留所有必需扫描脚和时钟脚。
+3. 解析 STIL 中的 SignalGroups、WaveformTables、ScanStructures、Procedures、MacroDefs 和 Pattern。
+4. 计算并核对测试周期数。
+5. 生成 NI Pattern Source、Timing、Pin Map 和转换报告。
+6. 如果勾选完全展开，逐周期生成展开版 Pattern。
+7. 如果勾选 NI 编译，再调用 NI 编译器生成 `.digipat`。
 
 转换期间界面会显示运行状态和日志。为了防止输出文件只写入一部分，转换结束前程序不会允许直接关闭窗口。
 
-### 3.5 查看结果
+### 3.6 查看结果
 
 成功后会弹出“转换完成”，其中包含：
 
@@ -179,7 +194,18 @@ device_scan.stil
 
 两种源文件表达的测试周期总数应相同。转换器会在写出展开文件后再次核对周期数；不一致时会停止并报告错误。
 
-### 4.2 `.digitiming` 包含什么
+### 4.2 多条且不等长的扫描链
+
+多个并行 ScanChain 在 NI 紧凑 Pattern 中使用同一个 `scan(max_length)`。例如三条链长度为 5624、5624、5623 时，每个 Shift 仍生成 5624 个测试周期。
+
+对较短扫描链，转换器会：
+
+- 在 ScanIn 数据前补一个填充值。该位会在后续有效位全部移入后被推出，不改变最终装载内容。
+- 在 ScanOut 数据后补一个 `X`。较短链的有效比较结束后不再比较，避免产生假失败。
+
+每条链原始长度、ScanIn、ScanOut、`ScanInversion` 和 `ScanMasterClock` 都会写入 `conversion_report.txt`。转换器不会再次翻转 ScanIn/ScanOut 字符串，因为 STIL Call 中的数据已经是外部扫描引脚上的波形值。
+
+### 4.3 `.digitiming` 包含什么
 
 转换器根据 STIL WaveformTable 生成 NI timeset：
 
@@ -190,7 +216,7 @@ device_scan.stil
 
 STIL 中同一个 waveform character 可能在不同引脚上代表不同边沿行为，因此转换器会按需创建专用 timeset，而不是把所有 `P` 简单替换成一个固定的 NI 符号。
 
-### 4.3 `.pinmap` 不包含什么
+### 4.4 `.pinmap` 不包含什么
 
 生成的 Pin Map 是逻辑模板，不包含测试站特有信息：
 
@@ -202,14 +228,15 @@ STIL 中同一个 waveform character 可能在不同引脚上代表不同边沿�
 
 这些信息必须根据实际测试站在 NI Digital Pattern Editor、TestStand Semiconductor Module 或相应 API 配置中补充。
 
-### 4.4 `conversion_report.txt` 的用途
+### 4.5 `conversion_report.txt` 的用途
 
 建议每次转换都保留此文件。它包含：
 
 - 输入 STIL 的完整路径和 SHA-256
 - 引脚名称及方向
 - WaveformTable 列表
-- Scan In、Scan Out 和扫描链长度
+- 每条 ScanChain 的 Scan In、Scan Out、长度、反相标记和 Master Clock
+- 已选择和已省略的引脚
 - 生成周期数及源文件声明的周期数
 - NI vector / scan 指令数量
 - 每个输出文件的大小和 SHA-256
@@ -323,28 +350,33 @@ STIL 中同一个 waveform character 可能在不同引脚上代表不同边沿�
 
 这是预期情况。生成的 `.pinmap` 只有逻辑引脚，且工具不生成电压电平。必须补充测试站资源、通道映射、Site、Connection 和器件电平，然后完成编译与硬件验证。
 
+### 7.9 某些引脚无法取消勾选
+
+ScanIn、ScanOut、ScanMasterClock 和使用 `P` waveform 的引脚是扫描执行所必需的。为了防止生成无法移位或无法编译的 Pattern，桌面版会锁定这些引脚。其他普通引脚可以取消。
+
 ## 8. 当前支持的 STIL 子集
 
-v0.2.1 支持：
+v0.3.0 支持：
 
 - `Signals` 中的标量 `In`、`Out` 和 `InOut` 引脚
 - 使用 `+` 连接的有序 `SignalGroups`
 - 数值型纳秒周期和边沿时间
 - 静态 `0`、`1`、`H`、`L`、`X`、`Z` 和 `N`
 - 三边沿 `P` 波形：`D/U/D` 和 `U/D/U`
-- 一条 `ScanChain`
+- 多条并行 `ScanChain`，包括长度不相同的扫描链
 - `Procedures`、`MacroDefs`、`W`、`C`、`V`、`Call`、`Macro` 和 `Shift`
 - TetraMAX `#` 参数替换
+- TetraMAX `\r` 重复和 `\j` 紧凑 WFC 写法
+- `F` 状态赋值
+- compare-valid `T`，转换为 NI `V`
 - 可选的 TetraMAX 周期摘要校验
 
 当前不支持：
 
-- 多条扫描链
 - STIL domains 和 selectors
 - loop、goto/match loop 及任意控制流
 - 嵌套 `Shift`
 - 在 `Signals` 中直接声明的多位 bus
-- compare symbol `T`
 - 非纳秒单位或公式形式的 timing 表达式
 - 自动生成电压电平
 - 自动分配 PXI 物理通道
@@ -411,12 +443,29 @@ stil-to-ni "D:\patterns\device_scan.stil" `
   --compiler "C:\Program Files\National Instruments\Digital Pattern Compiler\DigitalPatternCompiler.exe"
 ```
 
-### 9.5 其他参数
+### 9.5 选择输出引脚
+
+使用逗号分隔引脚名；ScanIn、ScanOut、ScanMasterClock 和 `P` waveform 引脚必须全部包含：
+
+```powershell
+stil-to-ni "D:\patterns\device_scan.stil" `
+  -o "D:\patterns\selected_output" `
+  --pins PA0,PA1,PA2,PA3,PA4,PA5,PA7,PA8,PA9
+```
+
+也可以重复使用 `--pins`：
+
+```powershell
+stil-to-ni input.stil -o output --pins PA0,PA1,PA2 --pins PA3,PA4,PA5,PA7,PA8,PA9
+```
+
+### 9.6 其他参数
 
 ```text
 --expand-scan     额外生成每周期一条 vector 的展开版
 --no-labels       不在输出 Pattern 中保留 STIL Call 标签
 --compile         调用 NI 编译器生成 .digipat
+--pins P1,P2      只输出指定引脚；必需扫描脚和时钟脚不能省略
 --compiler PATH   显式指定 DigitalPatternCompiler.exe
 --version         显示版本号
 ```

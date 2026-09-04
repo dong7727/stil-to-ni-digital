@@ -4,10 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from stil_to_ni.converter import convert_file
+from stil_to_ni.converter import ConversionError, convert_file, inspect_file
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "minimal_scan.stil"
+MULTI_FIXTURE = Path(__file__).parent / "fixtures" / "multi_scan.stil"
 
 
 class ConverterTests(unittest.TestCase):
@@ -53,6 +54,44 @@ class ConverterTests(unittest.TestCase):
             self.assertIn("<ReturnToLow>", timing)
             self.assertIn("<ReturnToHigh>", timing)
             self.assertIn("<Strobe>40 ns</Strobe>", timing)
+
+    def test_multiple_unequal_scan_chains(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = convert_file(MULTI_FIXTURE, Path(directory), expand_scan=True)
+            self.assertEqual(result.cycles, 16)
+            self.assertEqual(result.scan_instructions, 3)
+            source = result.files["pattern_source"].read_text(encoding="utf-8")
+            self.assertIn("scan_in SI0, SI1;", source)
+            self.assertIn("scan_out SO0, SO1;", source)
+            self.assertIn("SI1 1101;", source)
+            self.assertIn("SO1 LHLX;", source)
+            self.assertIn("default_WFT_CLK_P 1 0 1 1 1 V V;", source)
+            expanded = result.files["expanded_pattern_source"].read_text(encoding="utf-8")
+            self.assertNotIn("scan(", expanded)
+
+    def test_inspection_and_pin_selection(self) -> None:
+        inspection = inspect_file(MULTI_FIXTURE)
+        self.assertEqual(len(inspection.scan_chains), 2)
+        self.assertEqual([chain.length for chain in inspection.scan_chains], [4, 3])
+        required = {pin.name for pin in inspection.pins if pin.required}
+        self.assertEqual(required, {"CLK", "SI0", "SI1", "SO0", "SO1"})
+
+        with tempfile.TemporaryDirectory() as directory:
+            selected = ["CLK", "SI0", "SI1", "AUX", "SO0", "SO1"]
+            result = convert_file(MULTI_FIXTURE, Path(directory), selected_pins=selected)
+            self.assertEqual(result.pins, tuple(selected))
+            source = result.files["pattern_source"].read_text(encoding="utf-8")
+            timing = result.files["timing"].read_text(encoding="utf-8")
+            pinmap = result.files["pinmap"].read_text(encoding="utf-8")
+            report = result.files["report"].read_text(encoding="utf-8")
+            self.assertIn("pattern multi (CLK, SI0, SI1, AUX, SO0, SO1)", source)
+            self.assertNotIn('<PinEdge pin="CAP">', timing)
+            self.assertNotIn('<DUTPin name="CAP"', pinmap)
+            self.assertIn("Omitted pins: CAP", report)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ConversionError, "required scan/clock pins"):
+                convert_file(MULTI_FIXTURE, Path(directory), selected_pins=["CLK", "SI0"])
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
     QFrame,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -21,13 +22,15 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from . import __version__
 from .compiler import compile_pattern, find_compiler
-from .converter import ConversionError, ConversionResult, convert_file
+from .converter import ConversionError, ConversionResult, StilInspection, convert_file, inspect_file
 
 
 def _suggest_output(source: Path) -> Path:
@@ -83,24 +86,58 @@ class DropArea(QFrame):
             self.file_dropped.emit(str(candidate))
 
 
+class InspectionWorker(QObject):
+    succeeded = Signal(object)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, source: Path) -> None:
+        super().__init__()
+        self.source = source
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.succeeded.emit(inspect_file(self.source))
+        except (ConversionError, FileNotFoundError, OSError) as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(f"未预期错误：{type(exc).__name__}: {exc}")
+        finally:
+            self.finished.emit()
+
+
 class ConversionWorker(QObject):
     log = Signal(str)
     succeeded = Signal(object, str)
     failed = Signal(str)
     finished = Signal()
 
-    def __init__(self, source: Path, output: Path, expand: bool, should_compile: bool) -> None:
+    def __init__(
+        self,
+        source: Path,
+        output: Path,
+        expand: bool,
+        should_compile: bool,
+        selected_pins: tuple[str, ...],
+    ) -> None:
         super().__init__()
         self.source = source
         self.output = output
         self.expand = expand
         self.should_compile = should_compile
+        self.selected_pins = selected_pins
 
     @Slot()
     def run(self) -> None:
         try:
             self.log.emit("正在解析 STIL 并生成 NI 文件……")
-            result = convert_file(self.source, self.output, expand_scan=self.expand)
+            result = convert_file(
+                self.source,
+                self.output,
+                expand_scan=self.expand,
+                selected_pins=self.selected_pins,
+            )
             self.log.emit(f"解析完成：{result.cycles:,} 个测试周期，{len(result.pins)} 个引脚")
             for kind, path in result.files.items():
                 self.log.emit(f"{kind}: {path}")
@@ -136,12 +173,14 @@ class ConverterWindow(QMainWindow):
         self.running = False
         self.last_output: Path | None = None
         self.thread: QThread | None = None
-        self.worker: ConversionWorker | None = None
+        self.worker: QObject | None = None
+        self.inspection: StilInspection | None = None
+        self.inspection_source: Path | None = None
         self.compiler_available = self._compiler_available()
 
         self.setWindowTitle(f"STIL to NI-Digital  {__version__}")
-        self.resize(920, 720)
-        self.setMinimumSize(780, 640)
+        self.resize(960, 860)
+        self.setMinimumSize(820, 720)
         self._build_ui()
         self._apply_style()
 
@@ -178,19 +217,58 @@ class ConverterWindow(QMainWindow):
         self.input_edit.setPlaceholderText("请选择 STIL 文件")
         self.input_button = QPushButton("浏览…")
         self.input_button.clicked.connect(self._browse_input)
+        self.inspect_button = QPushButton("解析引脚")
+        self.inspect_button.clicked.connect(self._start_inspection)
         input_row.addWidget(self.input_edit, 1)
         input_row.addWidget(self.input_button)
+        input_row.addWidget(self.inspect_button)
         input_layout.addLayout(input_row)
         self.drop_area = DropArea()
         self.drop_area.file_dropped.connect(lambda path: self._set_input(Path(path)))
         input_layout.addWidget(self.drop_area)
         outer.addWidget(input_card)
 
+        pins_card = self._card()
+        pins_layout = QVBoxLayout(pins_card)
+        pins_layout.setContentsMargins(18, 16, 18, 18)
+        pins_layout.setSpacing(9)
+        pins_layout.addWidget(self._card_title("2  解析结果与引脚选择"))
+        pins_layout.addWidget(
+            self._hint("选择文件后会自动解析。可取消普通引脚；ScanIn、ScanOut 和扫描时钟为必选。")
+        )
+        pins_action_row = QHBoxLayout()
+        self.pin_summary = QLabel("尚未解析 STIL 文件")
+        self.pin_summary.setObjectName("hint")
+        self.select_all_button = QPushButton("全选")
+        self.select_all_button.clicked.connect(self._select_all_pins)
+        self.select_all_button.setEnabled(False)
+        self.required_only_button = QPushButton("仅保留必选")
+        self.required_only_button.clicked.connect(self._select_required_pins)
+        self.required_only_button.setEnabled(False)
+        pins_action_row.addWidget(self.pin_summary, 1)
+        pins_action_row.addWidget(self.select_all_button)
+        pins_action_row.addWidget(self.required_only_button)
+        pins_layout.addLayout(pins_action_row)
+        self.pin_table = QTableWidget(0, 4)
+        self.pin_table.setHorizontalHeaderLabels(("转换", "引脚", "方向", "角色"))
+        self.pin_table.setAlternatingRowColors(True)
+        self.pin_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.pin_table.setMinimumHeight(190)
+        self.pin_table.setEnabled(False)
+        header = self.pin_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.pin_table.itemChanged.connect(self._update_pin_summary)
+        pins_layout.addWidget(self.pin_table)
+        outer.addWidget(pins_card)
+
         options_card = self._card()
         options_layout = QVBoxLayout(options_card)
         options_layout.setContentsMargins(18, 16, 18, 18)
         options_layout.setSpacing(9)
-        options_layout.addWidget(self._card_title("2  输出与转换选项"))
+        options_layout.addWidget(self._card_title("3  输出与转换选项"))
         output_row = QHBoxLayout()
         self.output_edit = QLineEdit()
         self.output_edit.setPlaceholderText("请选择输出目录")
@@ -216,6 +294,7 @@ class ConverterWindow(QMainWindow):
         self.start_button = QPushButton("开始转换")
         self.start_button.setObjectName("primaryButton")
         self.start_button.clicked.connect(self._start)
+        self.start_button.setEnabled(False)
         self.open_button = QPushButton("打开输出目录")
         self.open_button.clicked.connect(self._open_output)
         self.open_button.setEnabled(False)
@@ -242,6 +321,7 @@ class ConverterWindow(QMainWindow):
         self.log.setObjectName("log")
         self.log.setReadOnly(True)
         self.log.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.log.setMinimumHeight(110)
         log_layout.addWidget(self.log)
         outer.addWidget(log_card, 1)
 
@@ -314,8 +394,143 @@ class ConverterWindow(QMainWindow):
             return
         self.input_edit.setText(str(source))
         self.output_edit.setText(str(_suggest_output(source)))
-        self.status_label.setText("已选择文件，可以开始转换")
+        self._clear_inspection()
+        self.status_label.setText("已选择文件，正在解析…")
         self._append_log(f"输入文件：{source}")
+        self._start_inspection()
+
+    def _clear_inspection(self) -> None:
+        self.inspection = None
+        self.inspection_source = None
+        self.pin_table.setRowCount(0)
+        self.pin_table.setEnabled(False)
+        self.pin_summary.setText("尚未解析 STIL 文件")
+        self.start_button.setEnabled(False)
+        self.select_all_button.setEnabled(False)
+        self.required_only_button.setEnabled(False)
+
+    @Slot()
+    def _start_inspection(self) -> None:
+        if self.running:
+            return
+        source = Path(self.input_edit.text().strip()).expanduser()
+        if not _is_stil(source):
+            QMessageBox.critical(self, "输入错误", "请选择存在的 .stil 或 .stil.gz 文件。")
+            return
+        self._clear_inspection()
+        self.running = True
+        self._set_controls(False)
+        self.status_label.setText("正在解析 STIL…")
+        self.progress.show()
+        self._append_log("正在解析引脚、Timing 和 ScanChain……")
+
+        self.thread = QThread(self)
+        self.worker = InspectionWorker(source.resolve())
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)  # type: ignore[attr-defined]
+        self.worker.succeeded.connect(self._finish_inspection)  # type: ignore[attr-defined]
+        self.worker.failed.connect(self._finish_inspection_error)  # type: ignore[attr-defined]
+        self.worker.finished.connect(self.thread.quit)  # type: ignore[attr-defined]
+        self.worker.finished.connect(self.worker.deleteLater)  # type: ignore[attr-defined]
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.start()
+
+    @Slot(object)
+    def _finish_inspection(self, inspection: StilInspection) -> None:
+        self.running = False
+        self.inspection = inspection
+        self.inspection_source = inspection.source
+        self.progress.hide()
+        self._populate_pins(inspection)
+        self._set_controls(True)
+        self.status_label.setText("解析完成，可以选择引脚并转换")
+        self._append_log(
+            f"解析完成：{len(inspection.pins)} 个引脚，{len(inspection.scan_chains)} 条 ScanChain"
+        )
+        for chain in inspection.scan_chains:
+            self._append_log(
+                f"ScanChain {chain.name}: {chain.scan_in} → {chain.scan_out}, "
+                f"长度 {chain.length:,}"
+            )
+
+    @Slot(str)
+    def _finish_inspection_error(self, detail: str) -> None:
+        self.running = False
+        self.progress.hide()
+        self._set_controls(True)
+        self.status_label.setText("解析失败")
+        self._append_log(f"解析错误：{detail}")
+        QMessageBox.critical(self, "解析失败", detail)
+
+    def _populate_pins(self, inspection: StilInspection) -> None:
+        self.pin_table.blockSignals(True)
+        self.pin_table.setRowCount(len(inspection.pins))
+        for row, pin in enumerate(inspection.pins):
+            include = QTableWidgetItem()
+            include.setCheckState(Qt.CheckState.Checked)
+            flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            if not pin.required:
+                flags |= Qt.ItemFlag.ItemIsUserCheckable
+            include.setFlags(flags)
+            include.setData(Qt.ItemDataRole.UserRole, pin.name)
+            self.pin_table.setItem(row, 0, include)
+            name_item = QTableWidgetItem(pin.name)
+            name_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.pin_table.setItem(row, 1, name_item)
+            direction_item = QTableWidgetItem(pin.direction)
+            direction_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.pin_table.setItem(row, 2, direction_item)
+            role = "、".join(pin.roles) if pin.roles else "普通引脚（可选）"
+            if pin.required:
+                role = f"必选；{role}"
+            role_item = QTableWidgetItem(role)
+            role_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.pin_table.setItem(row, 3, role_item)
+        self.pin_table.blockSignals(False)
+        self.pin_table.setEnabled(True)
+        self.select_all_button.setEnabled(True)
+        self.required_only_button.setEnabled(True)
+        self._update_pin_summary()
+
+    @Slot()
+    def _select_all_pins(self) -> None:
+        self.pin_table.blockSignals(True)
+        for row in range(self.pin_table.rowCount()):
+            self.pin_table.item(row, 0).setCheckState(Qt.CheckState.Checked)
+        self.pin_table.blockSignals(False)
+        self._update_pin_summary()
+
+    @Slot()
+    def _select_required_pins(self) -> None:
+        if self.inspection is None:
+            return
+        required = {pin.name for pin in self.inspection.pins if pin.required}
+        self.pin_table.blockSignals(True)
+        for row in range(self.pin_table.rowCount()):
+            item = self.pin_table.item(row, 0)
+            pin = str(item.data(Qt.ItemDataRole.UserRole))
+            item.setCheckState(
+                Qt.CheckState.Checked if pin in required else Qt.CheckState.Unchecked
+            )
+        self.pin_table.blockSignals(False)
+        self._update_pin_summary()
+
+    @Slot()
+    def _update_pin_summary(self) -> None:
+        selected = len(self._selected_pins())
+        total = self.pin_table.rowCount()
+        required = (
+            sum(pin.required for pin in self.inspection.pins) if self.inspection is not None else 0
+        )
+        self.pin_summary.setText(f"已选择 {selected}/{total} 个引脚，其中 {required} 个必选")
+
+    def _selected_pins(self) -> tuple[str, ...]:
+        selected: list[str] = []
+        for row in range(self.pin_table.rowCount()):
+            item = self.pin_table.item(row, 0)
+            if item.checkState() == Qt.CheckState.Checked:
+                selected.append(str(item.data(Qt.ItemDataRole.UserRole)))
+        return tuple(selected)
 
     @Slot()
     def _start(self) -> None:
@@ -323,6 +538,10 @@ class ConverterWindow(QMainWindow):
         output_text = self.output_edit.text().strip()
         if not _is_stil(source):
             QMessageBox.critical(self, "输入错误", "请选择存在的 .stil 或 .stil.gz 文件。")
+            return
+        resolved_source = source.resolve()
+        if self.inspection is None or self.inspection_source != resolved_source:
+            QMessageBox.critical(self, "尚未解析", "请先点击“解析引脚”，再选择引脚并转换。")
             return
         if not output_text:
             QMessageBox.critical(self, "输出错误", "请选择输出目录。")
@@ -363,6 +582,8 @@ class ConverterWindow(QMainWindow):
         self._append_log(f"输出：{output.resolve()}")
         self._append_log(f"完全展开：{'是' if self.expand_check.isChecked() else '否'}")
         self._append_log(f"编译 digipat：{'是' if self.compile_check.isChecked() else '否'}")
+        selected_pins = self._selected_pins()
+        self._append_log(f"转换引脚：{len(selected_pins)}/{len(self.inspection.pins)}")
         self.status_label.setText("正在转换…")
         self.progress.show()
 
@@ -372,6 +593,7 @@ class ConverterWindow(QMainWindow):
             output,
             self.expand_check.isChecked(),
             self.compile_check.isChecked(),
+            selected_pins,
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -411,13 +633,17 @@ class ConverterWindow(QMainWindow):
         for widget in (
             self.input_edit,
             self.input_button,
+            self.inspect_button,
             self.output_edit,
             self.output_button,
             self.expand_check,
-            self.start_button,
             self.drop_area,
         ):
             widget.setEnabled(enabled)
+        self.start_button.setEnabled(enabled and self.inspection is not None)
+        self.pin_table.setEnabled(enabled and self.inspection is not None)
+        self.select_all_button.setEnabled(enabled and self.inspection is not None)
+        self.required_only_button.setEnabled(enabled and self.inspection is not None)
         self.compile_check.setEnabled(enabled and self.compiler_available)
         if not enabled:
             self.open_button.setEnabled(False)
@@ -435,7 +661,7 @@ class ConverterWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.running:
-            QMessageBox.warning(self, "转换正在进行", "请等待转换完成后再关闭程序。")
+            QMessageBox.warning(self, "任务正在进行", "请等待解析或转换完成后再关闭程序。")
             event.ignore()
             return
         event.accept()

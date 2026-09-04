@@ -31,6 +31,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="compile generated .digipatsrc files to .digipat with the NI compiler",
     )
+    parser.add_argument(
+        "--pins",
+        action="append",
+        metavar="PIN[,PIN...]",
+        help="include only these pins; repeat the option or separate names with commas",
+    )
     parser.add_argument("--compiler", type=Path, help="path to DigitalPatternCompiler.exe")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
@@ -39,11 +45,20 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     try:
+        selected_pins = None
+        if args.pins:
+            selected_pins = [
+                pin.strip()
+                for group in args.pins
+                for pin in group.split(",")
+                if pin.strip()
+            ]
         result = convert_file(
             args.input,
             args.output_dir,
             expand_scan=args.expand_scan,
             keep_labels=not args.no_labels,
+            selected_pins=selected_pins,
         )
         print(f"Converted: {args.input}")
         print(f"Pins: {', '.join(result.pins)}")
