@@ -37,6 +37,10 @@ Download `STIL-to-NI-Digital.exe` from the
 [latest release](https://github.com/dong7727/stil-to-ni-digital/releases/latest).
 No Python installation is required.
 
+For installation, GUI options, output-file explanations, NI workflow,
+troubleshooting, and production validation, see the
+[detailed Chinese user guide](docs/USER_GUIDE_ZH-CN.md).
+
 1. Double-click `STIL-to-NI-Digital.exe`.
 2. Drag a `.stil` or `.stil.gz` file into the window, or click **Browse**.
 3. Choose an output directory.
