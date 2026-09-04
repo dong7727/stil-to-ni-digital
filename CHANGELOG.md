@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 - 2026-09-04
+
+- Replace the Tk desktop runtime with Qt for reliable startup from non-ASCII
+  Windows paths.
+- Pin the GUI toolkit and the Python stable-ABI DLL used by packaged builds.
+- Strengthen packaged executable smoke tests to enter and exit the GUI event
+  loop and fail on startup errors.
+
 ## 0.2.0 - 2026-09-04
 
 - Add a Windows desktop interface with file selection and drag-and-drop input.

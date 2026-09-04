@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stil-to-ni-digital"
-version = "0.2.0"
+version = "0.2.1"
 description = "Convert a practical TetraMAX STIL scan-pattern subset to NI-Digital pattern source and timing files."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,7 +21,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-gui = ["tkinterdnd2>=0.4"]
+gui = ["PySide6==6.8.3"]
 
 [project.urls]
 Documentation = "https://github.com/dong7727/stil-to-ni-digital#readme"

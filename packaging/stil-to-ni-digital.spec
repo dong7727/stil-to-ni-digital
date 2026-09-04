@@ -1,16 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_all
+import sys
+from pathlib import Path
 
 
-dnd_datas, dnd_binaries, dnd_hiddenimports = collect_all("tkinterdnd2")
+python_abi_dll = Path(sys.base_prefix) / "python3.dll"
 
 analysis = Analysis(
     ["windows_entry.py"],
     pathex=[],
-    binaries=dnd_binaries,
-    datas=dnd_datas,
-    hiddenimports=dnd_hiddenimports,
+    binaries=[(str(python_abi_dll), ".")],
+    datas=[],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

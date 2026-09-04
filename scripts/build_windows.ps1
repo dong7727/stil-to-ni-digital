@@ -19,9 +19,17 @@ finally {
 }
 
 $builtExe = Join-Path $projectRoot "packaging\dist\STIL-to-NI-Digital.exe"
-& $builtExe --self-test
-if ($LASTEXITCODE -ne 0) {
-    throw "Packaged executable self-test failed with exit code $LASTEXITCODE"
+$smoke = Start-Process -FilePath $builtExe -ArgumentList "--self-test" -PassThru
+try {
+    $smoke | Wait-Process -Timeout 60 -ErrorAction Stop
+}
+catch {
+    Stop-Process -Id $smoke.Id -Force -ErrorAction SilentlyContinue
+    throw "Packaged executable self-test timed out"
+}
+$smoke.Refresh()
+if ($smoke.ExitCode -ne 0) {
+    throw "Packaged executable self-test failed with exit code $($smoke.ExitCode)"
 }
 
 $checksum = (Get-FileHash -Algorithm SHA256 -LiteralPath $builtExe).Hash

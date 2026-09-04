@@ -21,7 +21,21 @@ jobs:
         working-directory: packaging
         run: python -m PyInstaller --noconfirm --clean stil-to-ni-digital.spec
       - name: Smoke test executable
-        run: .\packaging\dist\STIL-to-NI-Digital.exe --self-test
+        shell: pwsh
+        run: |
+          $exe = ".\packaging\dist\STIL-to-NI-Digital.exe"
+          $smoke = Start-Process -FilePath $exe -ArgumentList "--self-test" -PassThru
+          try {
+            $smoke | Wait-Process -Timeout 60 -ErrorAction Stop
+          }
+          catch {
+            Stop-Process -Id $smoke.Id -Force -ErrorAction SilentlyContinue
+            throw "Packaged executable self-test timed out"
+          }
+          $smoke.Refresh()
+          if ($smoke.ExitCode -ne 0) {
+            throw "Packaged executable self-test failed with exit code $($smoke.ExitCode)"
+          }
       - name: Create checksum
         shell: pwsh
         run: |
