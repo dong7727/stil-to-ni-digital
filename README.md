@@ -13,7 +13,7 @@ pattern generation and migration, while `.digipat` is the compiled pattern used
 by NI-Digital. See [NI's migration overview](https://www.ni.com/en/shop/electronic-test-instrumentation/digital-instruments/what-are-digital-pattern-instruments/important-considerations-when-migrating-to-the-digital-pattern-i.html).
 
 > [!IMPORTANT]
-> This project is **not a complete IEEE 1450 parser**. Version 0.3 targets the
+> This project is **not a complete IEEE 1450 parser**. Version 0.4 targets the
 > common flat, scan-oriented STIL subset emitted by Synopsys TetraMAX. It fails
 > on unsupported constructs rather than silently changing pattern semantics.
 
@@ -22,17 +22,26 @@ by NI-Digital. See [NI's migration overview](https://www.ni.com/en/shop/electron
 - Parses signals, ordered signal groups, waveform tables, multiple scan chains,
   procedures, macros, calls, conditions, vectors, and shift blocks.
 - Supports unequal parallel scan-chain lengths with semantics-preserving padding.
-- Expands TetraMAX compact WFC assignments and maps compare-valid `T` to NI `V`.
+- Resolves waveform events per pin and WFT; compare-high-Z requires an explicit
+  `--high-z-policy midband` to generate NI `M` (electrical equivalence unverified).
+- Preserves procedure-local Fixed constraints; conflicting assignments fail by
+  default or are recorded under an explicitly selected preservation policy.
 - Inspects the STIL first and lets desktop users select the output pins.
 - Converts STIL `P` waveforms into dedicated NI timesets using
   `ReturnToLow`/`ReturnToHigh` edges.
 - Keeps long scan data compact with NI `scan()` blocks.
+- Automatically omits location labels above NI's 8191-label limit, while
+  retaining every location in `pattern_labels.csv` (zero-based execution cycle).
+- Shows stage-weighted percentage progress in the GUI or with `--progress`.
+  NI compile/decompile stages hold their percentage while the external tool runs.
 - `--expand-scan` emits one ordinary NI vector statement per test cycle.
 - Verifies the generated cycle count against the TetraMAX summary when present.
 - Provides a Windows desktop app with file selection, drag-and-drop, progress,
   and conversion logs.
 - The command-line converter uses only the Python standard library.
 - Can invoke `DigitalPatternCompiler.exe` and produce `.digipat` files.
+- Automatically decompiles compiled patterns and checks full source round-trip.
+- Records input/config/output hashes, macro timelines and stage validation in a manifest.
 
 ## Windows desktop app
 
@@ -121,14 +130,40 @@ STIL static input     -> NI DriveNonReturn timeset
 SCLK: D/U/D at edges  -> NI ReturnToLow timeset, vector symbol 1
 CSN:  U/D/U at edges  -> NI ReturnToHigh timeset, vector symbol 0
 STIL H/L/X output     -> NI H/L/X with CompareStrobe
-STIL T output         -> NI V (compare valid)
+STIL compare-T event  -> reject by default; explicit midband policy maps to NI M
+STIL compare-V event  -> NI V (compare valid)
 ```
 
 A STIL shift such as a 3,013-bit scan operation becomes either one compact
 `scan(3013)` block or 3,013 ordinary vector statements with `--expand-scan`.
 Parallel chains share one `scan(max_length)` operation. Shorter chains receive
-a leading ScanIn filler and a trailing ScanOut `X`, preserving loaded data and
-disabling comparison only after their meaningful scan-out data ends.
+a leading ScanIn filler and trailing ScanOut filler from the effective context
+before the first placeholder. An absent parameter holds that context throughout
+the shift. ScanIn X cycles (and ScanOut states outside H/L/X) are emitted as
+ordinary vectors because NI scan strings cannot encode them. No cycles are added.
+
+## P2506 maintenance profile
+
+Use a **new empty output directory** for each build. The explicit profile binds
+to the source SHA-256 from the 2026-10-14 maintenance report:
+
+```powershell
+stil-to-ni P2506_TOP_stuck.scan.stil -o out-p2506 --profile p2506-20261014 --expand-scan --compile
+```
+
+The profile selects PA0–PA15 and NRST, preserves Fixed with diagnostics, maps
+compare-high-Z to M, and drives NRST low only during the guarded `test_setup`
+macro (186 cycles). Cycle 186 resumes original NRST=X. It never aliases por to
+NRST. A changed input hash, macro range, original state or resume boundary fails.
+The profile hash covers the uncompressed `.stil` file bytes; use that baseline
+file rather than a `.gz` wrapper. `--time-scale 10` scales every timing field
+exactly and leaves vector order/state unchanged, including the PWD PA5 clock.
+
+For other projects the defaults are strict. Deliberate exceptions can be selected
+with `--fixed-policy preserve_fixed_with_diagnostic` and `--high-z-policy midband`.
+The P2506 profile owns these two policies when selected. Its hardware results,
+T/M electrical equivalence and station load status remain unknown until tested.
+See [maintenance notes](docs/MAINTENANCE_20261014.md).
 
 ## Supported STIL subset
 
@@ -140,8 +175,8 @@ disabling comparison only after their meaningful scan-out data ends.
 - one or more parallel `ScanChain` definitions, including unequal lengths
 - `Procedures`, `MacroDefs`, `W`, `C`, `V`, `Call`, `Macro`, and `Shift`
 - TetraMAX `#` parameter substitution
-- TetraMAX `\r` repeat and `\j` compact WFC notation
-- `F` state assignments and compare-valid `T` waveforms
+- TetraMAX `\r` repeat and the leading `\j` marker on already flattened single-plane values
+- procedure-local `F` constraints and explicit conflict diagnostics
 - optional TetraMAX cycle-summary validation
 
 Currently unsupported:
@@ -149,6 +184,8 @@ Currently unsupported:
 - STIL domains and selectors
 - loops, goto/match loops, and arbitrary control flow
 - nested shift blocks
+- multiple vectors per Shift, embedded joins and multi-plane WFCMap evaluation
+- multiple compare strobes/pulse shapes per pin in one WFT
 - multi-bit buses declared directly in `Signals`
 - non-nanosecond or formula-based STIL timing expressions
 - automatic voltage-level generation
@@ -167,7 +204,8 @@ accuracy; see [Supported Pattern Conversion Tools with PXI Digital Pattern Instr
 The NI compiler is proprietary and is not included in this repository. The
 project's CI validates conversion structure and cycle preservation using
 synthetic fixtures. Hardware and compiler validation must be performed in an NI
-development environment.
+development environment. This maintenance additionally exercised local NI 19.0
+compilation; it does not establish compatibility or PASS on another station.
 
 ## Build the Windows app
 

@@ -7,12 +7,17 @@ changing test semantics. It is not a complete IEEE 1450 parser.
 from __future__ import annotations
 
 import gzip
+import csv
 import hashlib
+import json
 import re
+from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 from xml.sax.saxutils import escape
+
+from .profiles import PROFILES
 
 
 class ConversionError(ValueError):
@@ -39,6 +44,7 @@ class VectorOp:
     values: list[str]
     label: str | None = None
     opcode: str = ""
+    origin: dict = field(default_factory=dict)
 
     @property
     def cycles(self) -> int:
@@ -88,6 +94,15 @@ class StilInspection:
 class DefinitionEvent:
     kind: str
     payload: object
+    line: int = 0
+
+
+@dataclass(frozen=True)
+class Waveform:
+    symbol: str
+    events: tuple[tuple[Decimal, str], ...]
+    pulse: tuple[str, Decimal, Decimal] | None = None
+    compare: Decimal | None = None
 
 
 @dataclass
@@ -98,9 +113,10 @@ class Model:
     directions: dict[str, str] = field(default_factory=dict)
     groups: dict[str, list[str]] = field(default_factory=dict)
     waveform_tables: list[str] = field(default_factory=list)
-    periods_ns: dict[str, float] = field(default_factory=dict)
-    compare_ns: float = 40.0
-    pulse_edges: dict[str, tuple[str, float, float]] = field(default_factory=dict)
+    periods_ns: dict[str, Decimal] = field(default_factory=dict)
+    waveforms: dict[tuple[str, str, str], Waveform] = field(default_factory=dict)
+    pulse_edges: dict[tuple[str, str], tuple[str, Decimal, Decimal]] = field(default_factory=dict)
+    compare_edges: dict[tuple[str, str], Decimal] = field(default_factory=dict)
     scan_chains: list[ScanChain] = field(default_factory=list)
     omitted_pins: list[str] = field(default_factory=list)
     procedures: dict[str, list[DefinitionEvent]] = field(default_factory=dict)
@@ -111,6 +127,14 @@ class Model:
     used_timesets: list[str] = field(default_factory=list)
     timeset_meta: dict[str, tuple[str, tuple[str, ...]]] = field(default_factory=dict)
     pattern_name: str = "converted_pattern"
+    fixed_policy: str = "error"
+    high_z_policy: str = "error"
+    time_scale: Decimal = Decimal(1)
+    project_profile: dict = field(default_factory=dict)
+    diagnostics: list[dict] = field(default_factory=list)
+    invocations: list[dict] = field(default_factory=list)
+    context: dict = field(default_factory=dict)
+    cycle: int = 0
 
 
 @dataclass(frozen=True)
@@ -127,6 +151,14 @@ def _read_text(path: Path) -> str:
         with gzip.open(path, "rt", encoding="utf-8") as stream:
             return stream.read()
     return path.read_text(encoding="utf-8")
+
+
+def _strip_comments(text: str) -> str:
+    # Preserve offsets and lines, and never interpret statement words in comments.
+    token = re.compile(r'"(?:\\.|[^"\\])*"|\'[^\']*\'|//[^\n]*|/\*.*?\*/|\bAnn\s*\{\*.*?\*\}', re.DOTALL)
+    return token.sub(
+        lambda m: m[0] if m[0].startswith(('"', "'")) else re.sub(r"[^\n]", " ", m[0]), text
+    )
 
 
 def _balanced_end(text: str, open_pos: int) -> int:
@@ -171,7 +203,9 @@ def _named_blocks(section_body: str) -> dict[str, str]:
 
 def _expand_assignment(value: str) -> str:
     """Expand the TetraMAX compact WFC notation used in STIL assignments."""
-    value = re.sub(r"\\j\b", "", value)
+    # Only the already flattened, single-plane TetraMAX prefix is supported.
+    # An embedded join needs WFCMap evaluation and must not be silently deleted.
+    value = re.sub(r"^\s*\\j\s+", "", value)
 
     def expand_repeat(match: re.Match[str]) -> str:
         return match.group(2) * int(match.group(1))
@@ -184,10 +218,18 @@ def _expand_assignment(value: str) -> str:
 
 
 def _assignments(body: str) -> dict[str, str]:
-    return {
-        name: _expand_assignment(value)
-        for name, value in re.findall(r'"([^"]+)"\s*=\s*([^;]+);', body, re.DOTALL)
-    }
+    pattern = re.compile(r'\s*"([^"]+)"\s*=\s*([^;]+);', re.DOTALL)
+    result: dict[str, str] = {}
+    pos = 0
+    while body[pos:].strip():
+        match = pattern.match(body, pos)
+        if not match:
+            raise ConversionError(f"unsupported assignment near {body[pos:pos + 80]!r}")
+        if match[1] in result:
+            raise ConversionError(f"duplicate assignment to {match[1]!r}")
+        result[match[1]] = _expand_assignment(match[2])
+        pos = match.end()
+    return result
 
 
 def _sanitize(value: str, fallback: str = "label") -> str:
@@ -200,8 +242,8 @@ def _sanitize(value: str, fallback: str = "label") -> str:
     return value
 
 
-def _fmt_ns(value: float) -> str:
-    return f"{int(value)} ns" if float(value).is_integer() else f"{value:g} ns"
+def _fmt_ns(value: Decimal) -> str:
+    return f"{value.normalize():f} ns"
 
 
 def _sha256(path: Path) -> str:
@@ -234,6 +276,8 @@ def _parse_signals_groups(text: str, model: Model) -> None:
         r'"([^"]+)"\s*=\s*\'([^\']+)\'[^;]*;', group_block, re.DOTALL
     ):
         expanded: list[str] = []
+        if not re.fullmatch(r'\s*"[^"]+"(?:\s*\+\s*"[^"]+")*\s*', expression):
+            raise ConversionError(f"unsupported group expression for {name!r}")
         for item in re.findall(r'"([^"]+)"', expression):
             if item in model.groups:
                 expanded.extend(model.groups[item])
@@ -257,38 +301,54 @@ def _parse_timing(text: str, model: Model) -> None:
         if not period:
             raise ConversionError(f"waveform table {name!r} needs a numeric ns period")
         model.waveform_tables.append(name)
-        model.periods_ns[name] = float(period.group(1))
-
-        compare_edges = re.findall(
-            r'\{\s*[HLT]\s*\{[^}]*\'([0-9.]+)ns\'\s*[HLT]', body, re.DOTALL
-        )
-        if compare_edges:
-            values = {float(value) for value in compare_edges}
-            if len(values) != 1:
-                raise ConversionError(f"waveform table {name!r} has multiple compare strobes")
-            model.compare_ns = values.pop()
-
-        pulse_re = re.compile(
-            r'"([^"]+)"\s*\{\s*P\s*\{\s*\'0ns\'\s*([DU]);\s*'
-            r"'([0-9.]+)ns'\s*([DU]);\s*'([0-9.]+)ns'\s*([DU]);\s*\}\s*\}",
-            re.DOTALL,
-        )
-        for pin, initial, data_time, data_level, return_time, return_level in pulse_re.findall(body):
-            if pin not in model.pins:
-                continue
-            if (initial, data_level, return_level) == ("D", "U", "D"):
-                mode = "ReturnToLow"
-            elif (initial, data_level, return_level) == ("U", "D", "U"):
-                mode = "ReturnToHigh"
-            else:
-                raise ConversionError(f"unsupported P waveform on pin {pin!r}")
-            edge = (mode, float(data_time), float(return_time))
-            if pin in model.pulse_edges and model.pulse_edges[pin] != edge:
-                raise ConversionError(f"P waveform for pin {pin!r} differs across tables")
-            model.pulse_edges[pin] = edge
+        model.periods_ns[name] = Decimal(period.group(1))
+        if model.periods_ns[name] <= 0:
+            raise ConversionError(f"invalid period in {name!r}")
+        wave_body = _extract_block(body, r"\bWaveforms\s*\{")
+        wave_re = re.compile(r'\s*"([^"]+)"\s*\{\s*(\w)\s*\{([^{}]*)\}\s*\}', re.DOTALL)
+        cursor = 0
+        while wave_body[cursor:].strip():
+            wave = wave_re.match(wave_body, cursor)
+            if not wave:
+                raise ConversionError(f"unsupported waveform in {name!r}: {wave_body[cursor:cursor + 80]!r}")
+            event_re = re.compile(r"\s*'([0-9.]+)ns'\s*([A-Z]);")
+            if event_re.sub('', wave[3]).strip():
+                raise ConversionError(f"unsupported waveform events in {name!r}/{wave[1]}/{wave[2]}")
+            events = tuple((Decimal(t), event) for t, event in event_re.findall(wave[3]))
+            parsed = _decode_waveform(events, f"{name}/{wave[1]}/{wave[2]}")
+            for pin in _target_pins(model, wave[1]):
+                key = (name, pin, wave[2])
+                if key in model.waveforms and model.waveforms[key] != parsed:
+                    raise ConversionError(f"conflicting waveform definition: {key}")
+                model.waveforms[key] = parsed
+                if parsed.pulse:
+                    if (name, pin) in model.pulse_edges and model.pulse_edges[name, pin] != parsed.pulse:
+                        raise ConversionError(f"multiple pulse shapes on {name}/{pin} are unsupported")
+                    model.pulse_edges[name, pin] = parsed.pulse
+                if parsed.compare is not None:
+                    previous = model.compare_edges.get((name, pin), parsed.compare)
+                    if previous != parsed.compare:
+                        raise ConversionError(f"multiple compare strobes on {name}/{pin} are unsupported")
+                    model.compare_edges[name, pin] = parsed.compare
+            cursor = wave.end()
         pos = end + 1
     if not model.waveform_tables:
         raise ConversionError("no waveform tables found")
+
+
+def _decode_waveform(events: tuple[tuple[Decimal, str], ...], context: str) -> Waveform:
+    if not events or events[0][0] != 0 or any(a[0] > b[0] for a, b in zip(events, events[1:])):
+        raise ConversionError(f"unsupported event timeline: {context}: {events}")
+    codes = ''.join(code for _, code in events)
+    if len(events) == 1 and codes in 'DUZXN':
+        return Waveform({'D': '0', 'U': '1', 'Z': 'X', 'X': 'X', 'N': 'X'}[codes], events)
+    if len(events) == 2 and codes[0] in 'ZX' and codes[1] in 'HLXTV':
+        # STIL T is compare high impedance; V is compare valid (H or L).
+        return Waveform({'T': 'M'}.get(codes[1], codes[1]), events, compare=events[1][0])
+    if codes in ('DUD', 'UDU') and events[0][0] < events[1][0] < events[2][0]:
+        mode = 'ReturnToLow' if codes == 'DUD' else 'ReturnToHigh'
+        return Waveform('1' if codes == 'DUD' else '0', events, (mode, events[1][0], events[2][0]))
+    raise ConversionError(f"unsupported waveform: {context}: {events}")
 
 
 def _parse_scan(text: str, model: Model) -> None:
@@ -339,38 +399,42 @@ def _parse_scan(text: str, model: Model) -> None:
         raise ConversionError(f"pins cannot be both ScanIn and ScanOut: {sorted(overlap)}")
 
 
-def _definition_events(body: str) -> list[DefinitionEvent]:
+def _definition_events(body: str, first_line: int = 1) -> list[DefinitionEvent]:
     events: list[DefinitionEvent] = []
     pos = 0
-    token_re = re.compile(r"\b(W|C|F|V|Shift)\b")
-    while match := token_re.search(body, pos):
+    token_re = re.compile(r'\s*(?:"[^"\n]+"\s*:\s*)?\b(W|C|F|V|Shift)\b')
+    while body[pos:].strip():
+        match = token_re.match(body, pos)
+        if not match:
+            raise ConversionError(f"unsupported definition statement at line {first_line + body.count(chr(10), 0, pos)}: {body[pos:pos + 80]!r}")
         kind = match.group(1)
+        line = first_line + body.count('\n', 0, match.start(1))
         if kind == "W":
-            wft = re.match(r'W\s+"([^"]+)"\s*;', body[match.start() :])
+            wft = re.match(r'W\s+"([^"]+)"\s*;', body[match.start(1) :])
             if not wft:
                 raise ConversionError("malformed W statement in definition")
-            events.append(DefinitionEvent("W", wft.group(1)))
-            pos = match.start() + wft.end()
+            events.append(DefinitionEvent("W", wft.group(1), line))
+            pos = match.start(1) + wft.end()
             continue
         open_pos = body.find("{", match.end())
         if open_pos < 0:
             raise ConversionError(f"malformed {kind} block")
         end = _balanced_end(body, open_pos)
         inner = body[open_pos + 1 : end]
-        payload: object = _definition_events(inner) if kind == "Shift" else _assignments(inner)
-        events.append(DefinitionEvent(kind, payload))
+        payload: object = _definition_events(inner, first_line + body.count('\n', 0, open_pos + 1)) if kind == "Shift" else _assignments(inner)
+        events.append(DefinitionEvent(kind, payload, line))
         pos = end + 1
     return events
 
 
 def _parse_definitions(text: str, model: Model) -> None:
     procedures = _named_blocks(_extract_block(text, r"^Procedures\s*\{"))
-    model.procedures = {name: _definition_events(body) for name, body in procedures.items()}
+    model.procedures = {name: _definition_events(body, 1 + text.count('\n', 0, text.index(body, text.index('Procedures')))) for name, body in procedures.items()}
     try:
         macros = _named_blocks(_extract_block(text, r"^MacroDefs\s*\{"))
     except ConversionError:
         macros = {}
-    model.macros = {name: _definition_events(body) for name, body in macros.items()}
+    model.macros = {name: _definition_events(body, 1 + text.count('\n', 0, text.index(body, text.index('MacroDefs')))) for name, body in macros.items()}
 
 
 def _target_pins(model: Model, target: str) -> list[str]:
@@ -385,8 +449,9 @@ def _apply(
     state: dict[str, str],
     assignments: dict[str, str],
     params: dict[str, str] | None = None,
-) -> None:
+) -> dict[str, str]:
     params = params or {}
+    assigned: dict[str, str] = {}
     for target, template in assignments.items():
         pins = _target_pins(model, target)
         if len(template) != len(pins):
@@ -394,7 +459,7 @@ def _apply(
                 f"assignment width mismatch for {target!r}: got {len(template)}, expected {len(pins)}"
             )
         parameter = params.get(target)
-        if parameter is not None and len(parameter) != len(pins):
+        if '#' in template and parameter is not None and len(parameter) != len(pins):
             raise ConversionError(f"call parameter width mismatch for {target!r}")
         for index, (pin, symbol) in enumerate(zip(pins, template)):
             if symbol == "#":
@@ -405,6 +470,8 @@ def _apply(
                 else:
                     symbol = state[pin]
             state[pin] = symbol
+            assigned[pin] = target
+    return assigned
 
 
 def _timeset_name(model: Model, wft: str, pulse_pins: Iterable[str]) -> str:
@@ -419,31 +486,49 @@ def _timeset_name(model: Model, wft: str, pulse_pins: Iterable[str]) -> str:
 
 
 def _map_vector(model: Model, state: dict[str, str]) -> tuple[str, list[str]]:
-    pulse_pins = [pin for pin in model.pins if state[pin] == "P"]
-    values: list[str] = []
-    for pin in model.pins:
-        symbol = state[pin]
-        if symbol == "P":
-            mode = model.pulse_edges.get(pin, (None, 0, 0))[0]
-            if mode == "ReturnToLow":
-                symbol = "1"
-            elif mode == "ReturnToHigh":
-                symbol = "0"
-            else:
-                raise ConversionError(f"pin {pin!r} uses P without a supported waveform")
-        elif symbol in "ZN":
-            symbol = "X"
-        elif symbol == "T":
-            symbol = "V"
-        elif symbol not in "01HLXV":
-            raise ConversionError(f"unsupported vector symbol {symbol!r} on {pin!r}")
-        values.append(symbol)
-    return _timeset_name(model, state["__wft__"], pulse_pins), values
+    wft = state['__wft__']
+    mapped = [_map_symbol(model, wft, pin, state[pin]) for pin in model.pins]
+    pulses = [pin for pin in model.pins if model.waveforms[wft, pin, state[pin]].pulse]
+    return _timeset_name(model, wft, pulses), mapped
+
+
+def _map_symbol(model: Model, wft: str, pin: str, symbol: str) -> str:
+    wave = model.waveforms.get((wft, pin, symbol))
+    if wave is None:
+        raise ConversionError(f"undefined waveform {wft}/{pin}/{symbol}; context={model.context}")
+    if wave.symbol == 'M' and model.high_z_policy != 'midband':
+        raise ConversionError(f"compare-high-Z on {pin} requires explicit high_z_policy='midband'; electrical equivalence is unverified")
+    return wave.symbol
 
 
 def _emit_vector(model: Model, state: dict[str, str]) -> None:
     timeset, values = _map_vector(model, state)
-    model.ops.append(VectorOp(timeset, values))
+    model.ops.append(VectorOp(timeset, values, origin=model.context.copy()))
+    model.cycle += 1
+
+
+def _apply_event(model: Model, state: dict[str, str], event: DefinitionEvent,
+                 params: dict[str, str], fixed: dict[str, str], origins: dict[str, dict]) -> None:
+    assigned = _apply(model, state, event.payload, params)
+    for pin, target in assigned.items():
+        origins[pin] = {'statement': event.kind, 'target': target, 'line': event.line}
+        if event.kind == 'F':
+            if pin in fixed and fixed[pin] != state[pin]:
+                raise ConversionError(f"conflicting Fixed declarations for {pin} at line {event.line}")
+            fixed[pin] = state[pin]
+        elif pin in fixed and state[pin] != fixed[pin] and model.fixed_policy == 'error':
+            raise ConversionError(f"Fixed conflict on {pin}: {fixed[pin]} vs {state[pin]}, {target}, line {event.line}, {model.context}")
+
+
+def _effective_state(model: Model, state: dict[str, str], fixed: dict[str, str], origins: dict[str, dict]) -> dict[str, str]:
+    for pin, symbol in fixed.items():
+        if state[pin] != symbol:
+            if model.fixed_policy == 'error':
+                raise ConversionError(f"Fixed conflict on {pin}: {symbol} vs {state[pin]}, {model.context}")
+            model.diagnostics.append({'kind': 'fixed_conflict', 'cycle': model.cycle,
+                **model.context, 'pin': pin, 'original': state[pin], 'replacement': symbol,
+                'assignment': origins.get(pin), 'policy': model.fixed_policy})
+    return {**state, **fixed}
 
 
 def _execute_shift(
@@ -451,13 +536,17 @@ def _execute_shift(
     events: list[DefinitionEvent],
     state: dict[str, str],
     params: dict[str, str],
+    fixed: dict[str, str],
+    origins: dict[str, dict],
 ) -> None:
     vector_assignments: dict[str, str] | None = None
     for event in events:
+        if vector_assignments is not None:
+            raise ConversionError("only a final, single V statement is supported inside Shift")
         if event.kind == "W":
             state["__wft__"] = str(event.payload)
         elif event.kind in {"C", "F"}:
-            _apply(model, state, event.payload, params)  # type: ignore[arg-type]
+            _apply_event(model, state, event, params, fixed, origins)
         elif event.kind == "V":
             if vector_assignments is not None:
                 raise ConversionError("only one V statement is supported inside Shift")
@@ -472,6 +561,7 @@ def _execute_shift(
         for chain in model.scan_chains
         for pin in (chain.scan_in, chain.scan_out)
     }
+    placeholders: set[str] = set()
     for target, template in vector_assignments.items():
         pins = _target_pins(model, target)
         if len(template) != len(pins):
@@ -479,6 +569,7 @@ def _execute_shift(
         parameter = params.get(target)
         for index, (pin, symbol) in enumerate(zip(pins, template)):
             if symbol == "#" and pin in scan_pins:
+                placeholders.add(pin)
                 continue
             if symbol == "#":
                 if parameter is not None and len(parameter) == len(pins):
@@ -488,39 +579,42 @@ def _execute_shift(
                 else:
                     symbol = state[pin]
             state[pin] = symbol
+            origins[pin] = {'statement': 'Shift/V', 'target': target, 'line': event.line}
+    if placeholders != scan_pins:
+        raise ConversionError("Shift must use exactly one # placeholder on every ScanIn/ScanOut pin")
+    if fixed.keys() & scan_pins:
+        raise ConversionError("Fixed on serial scan pins is not supported")
+    if any(target in params for target in vector_assignments if target in model.groups and set(_target_pins(model, target)) & scan_pins):
+        raise ConversionError("serial group parameters are unsupported; pass each scan pin separately")
 
-    timeset, values = _map_vector(model, state)
+    effective = _effective_state(model, state, fixed, origins)
+    timeset, values = _map_vector(model, effective)
     scan_count = max(chain.length for chain in model.scan_chains)
     sequences: dict[str, str] = {}
     for chain in model.scan_chains:
-        default_scan_in = state[chain.scan_in] if state[chain.scan_in] in "01" else "0"
-        scan_in = params.get(chain.scan_in, default_scan_in * chain.length)
-        scan_out = params.get(chain.scan_out, state[chain.scan_out] * chain.length)
-        scan_out = scan_out.translate(str.maketrans({"Z": "X", "N": "X"}))
-        if len(scan_in) != chain.length or len(scan_out) != chain.length:
-            raise ConversionError(
-                f"scan strings for chain {chain.name!r} must contain {chain.length} symbols "
-                f"({chain.scan_in}={len(scan_in)}, {chain.scan_out}={len(scan_out)})"
-            )
-        if set(scan_in) - set("01"):
-            raise ConversionError(
-                f"unsupported scan-in symbols on {chain.scan_in!r}: "
-                f"{sorted(set(scan_in) - set('01'))}"
-            )
-        if set(scan_out) - set("HLX"):
-            raise ConversionError(
-                f"unsupported scan-out symbols on {chain.scan_out!r}: "
-                f"{sorted(set(scan_out) - set('HLX'))}"
-            )
-
-        padding = scan_count - chain.length
-        # An early ScanIn filler is shifted out after the meaningful data.  A
-        # trailing ScanOut X disables comparison after a shorter chain ends.
-        sequences[chain.scan_in] = scan_in[0] * padding + scan_in
-        sequences[chain.scan_out] = scan_out + "X" * padding
-        values[model.pins.index(chain.scan_in)] = "_"
-        values[model.pins.index(chain.scan_out)] = "_"
-        state[chain.scan_in] = scan_in[-1]
+        for pin, leading in ((chain.scan_in, True), (chain.scan_out, False)):
+            data = params.get(pin)
+            if data is not None and len(data) != chain.length:
+                raise ConversionError(f"scan strings for chain {chain.name!r} must contain {chain.length} symbols ({pin}={len(data)})")
+            context = effective[pin]
+            padding = scan_count - len(data or '')
+            raw = ((context * padding + data) if leading else (data + context * padding)) if data is not None else context * scan_count
+            wft = state['__wft__']
+            mapping = {char: _map_symbol(model, wft, pin, char) for char in set(raw)}
+            if any(model.waveforms[wft, pin, char].pulse for char in raw):
+                raise ConversionError(f"pulse waveform in serial data is unsupported: {pin}")
+            sequence = ''.join(mapping[char] for char in raw)
+            allowed = '01X' if leading else 'HLXMV'
+            if set(sequence) - set(allowed):
+                raise ConversionError(f"unsupported scan {'input' if leading else 'output'} states on {pin}: {set(sequence) - set(allowed)}")
+            sequences[pin] = sequence
+            values[model.pins.index(pin)] = '_'
+            state[pin] = raw[-1]
+            if padding:
+                model.diagnostics.append({'kind': 'scan_padding', **model.context, 'cycle': model.cycle,
+                    'pin': pin, 'chain': chain.name, 'side': 'leading' if leading else 'trailing',
+                    'count': padding, 'source_symbol': context, 'ni_symbol': mapping[context],
+                    'parameter_missing': data is None})
 
     model.ops.append(
         ScanOp(
@@ -530,6 +624,7 @@ def _execute_shift(
             sequences,
         )
     )
+    model.cycle += scan_count
 
 
 def _execute_definition(
@@ -539,18 +634,22 @@ def _execute_definition(
     params: dict[str, str] | None = None,
 ) -> None:
     params = params or {}
+    fixed: dict[str, str] = {}
+    origins: dict[str, dict] = {}
     for event in events:
         if event.kind == "W":
             state["__wft__"] = str(event.payload)
         elif event.kind in {"C", "F", "V"}:
-            _apply(model, state, event.payload, params)  # type: ignore[arg-type]
+            _apply_event(model, state, event, params, fixed, origins)
             if event.kind == "V":
-                _emit_vector(model, state)
+                model.context['definition_line'] = event.line
+                _emit_vector(model, _effective_state(model, state, fixed, origins))
         elif event.kind == "Shift":
-            _execute_shift(model, event.payload, state, params)  # type: ignore[arg-type]
+            model.context['definition_line'] = event.line
+            _execute_shift(model, event.payload, state, params, fixed, origins)
 
 
-def _parse_pattern(text: str, model: Model, keep_labels: bool) -> None:
+def _parse_pattern(text: str, model: Model, keep_labels: bool, progress=None) -> None:
     match = re.search(r'^Pattern\s+"([^"]+)"\s*\{', text, re.MULTILINE)
     if not match:
         raise ConversionError("no top-level Pattern block found")
@@ -561,54 +660,77 @@ def _parse_pattern(text: str, model: Model, keep_labels: bool) -> None:
     state["__wft__"] = model.waveform_tables[0]
 
     pos = 0
-    token_re = re.compile(r"\b(W|C|F|V|Macro|Call)\b")
+    token_re = re.compile(r'\s*(?:"(?P<label>[^"]+)"\s*:\s*)?(?P<kind>W|C|F|V|Macro|Call)\b')
     labels: set[str] = set()
-    while token := token_re.search(body, pos):
-        kind = token.group(1)
+    fixed: dict[str, str] = {}
+    origins: dict[str, dict] = {}
+    instances: dict[tuple[str, str], int] = {}
+    line = text.count('\n', 0, open_pos + 1) + 1
+    line_pos = 0
+    statements = {kind: re.compile(pattern) for kind, pattern in {
+        'W': r'W\s+"([^"]+)"\s*;',
+        'Macro': r'Macro\s+"([^"]+)"\s*;',
+        'Call': r'Call\s+"([^"]+)"\s*\{',
+    }.items()}
+    while pos < len(body):
+        token = token_re.match(body, pos)
+        if not token:
+            if not body[pos:].strip():
+                break
+            raise ConversionError(f"unsupported Pattern statement near {body[pos:pos + 80]!r}")
+        if progress:
+            progress(20 + 35 * pos // max(1, len(body)), '解析 Pattern')
+        kind = token['kind']
+        start = token.start('kind')
+        line += body.count('\n', line_pos, start)
+        line_pos = start
+        model.context = {'scope': 'Pattern', 'line': line}
         if kind == "W":
-            statement = re.match(r'W\s+"([^"]+)"\s*;', body[token.start() :])
+            statement = statements['W'].match(body, start)
             if not statement:
                 raise ConversionError("malformed W statement in Pattern")
             state["__wft__"] = statement.group(1)
-            pos = token.start() + statement.end()
+            pos = statement.end()
             continue
         if kind in {"C", "F", "V"}:
             open_block = body.find("{", token.end())
             end = _balanced_end(body, open_block)
-            _apply(model, state, _assignments(body[open_block + 1 : end]))
+            event = DefinitionEvent(kind, _assignments(body[open_block + 1 : end]), line)
+            _apply_event(model, state, event, {}, fixed, origins)
             if kind == "V":
-                _emit_vector(model, state)
+                _emit_vector(model, _effective_state(model, state, fixed, origins))
             pos = end + 1
             continue
         if kind == "Macro":
-            statement = re.match(r'Macro\s+"([^"]+)"\s*;', body[token.start() :])
+            if fixed:
+                raise ConversionError('Pattern-level Fixed across macros is unsupported')
+            statement = statements['Macro'].match(body, start)
             if not statement:
                 raise ConversionError("malformed Macro statement")
             name = statement.group(1)
             if name not in model.macros:
                 raise ConversionError(f"undefined macro {name!r}")
-            _execute_definition(model, model.macros[name], state)
-            pos = token.start() + statement.end()
+            _invoke(model, 'macro', name, model.macros[name], state, {}, line, instances)
+            pos = statement.end()
             continue
 
-        statement = re.match(r'Call\s+"([^"]+)"\s*\{', body[token.start() :])
+        statement = statements['Call'].match(body, start)
         if not statement:
             raise ConversionError("malformed Call statement")
         name = statement.group(1)
         if name not in model.procedures:
             raise ConversionError(f"undefined procedure {name!r}")
-        call_open = body.find("{", token.start(), token.start() + statement.end())
+        call_open = body.find("{", start, statement.end())
         call_end = _balanced_end(body, call_open)
         params = _assignments(body[call_open + 1 : call_end])
         before = len(model.ops)
-        _execute_definition(model, model.procedures[name], state, params)
+        if fixed:
+            raise ConversionError('Pattern-level Fixed across calls is unsupported')
+        _invoke(model, 'procedure', name, model.procedures[name], state, params, line, instances)
 
         if keep_labels and len(model.ops) > before:
-            line_start = body.rfind("\n", pos, token.start()) + 1
-            prefix = body[line_start : token.start()]
-            label_match = re.search(r'"([^"]+)"\s*:\s*$', prefix)
-            if label_match:
-                label = _sanitize(label_match.group(1))
+            if token['label']:
+                label = _sanitize(token['label'])
                 base = label
                 suffix = 2
                 while label in labels:
@@ -626,6 +748,84 @@ def _parse_pattern(text: str, model: Model, keep_labels: bool) -> None:
         model.expected_cycles = int(summary.group(2))
 
 
+def _invoke(model: Model, kind: str, name: str, events: list[DefinitionEvent],
+            state: dict[str, str], params: dict[str, str], line: int,
+            instances: dict[tuple[str, str], int]) -> None:
+    index = instances.get((kind, name), 0)
+    instances[kind, name] = index + 1
+    context = {'scope': kind, 'name': name, 'invocation_index': index, 'line': line}
+    before, first_cycle = len(model.ops), model.cycle
+    model.context = context.copy()
+    _execute_definition(model, events, state, params)
+    model.invocations.append({**context, 'start_cycle': first_cycle, 'cycles': model.cycle - first_cycle,
+                              'start_op': before, 'end_op': len(model.ops)})
+
+
+def _apply_project_entry(model: Model) -> None:
+    rule = model.project_profile.get('entry')
+    if not rule:
+        return
+    instances = [item for item in model.invocations if item['scope'] == 'macro' and item['name'] == rule['macro']]
+    if len(instances) != rule['expected_instances']:
+        raise ConversionError('entry override macro instance count mismatch')
+    instance = instances[rule['invocation_index']]
+    if instance['start_cycle'] != rule['expected_start_cycle'] or instance['cycles'] != rule['expected_cycles']:
+        raise ConversionError('entry override macro cycle range mismatch')
+    index = model.pins.index(rule['pin'])
+    selected = model.ops[instance['start_op']:instance['end_op']]
+    if any(not isinstance(op, VectorOp) or op.values[index] != rule['expected_ni_state'] for op in selected):
+        raise ConversionError('entry override original state mismatch')
+    if instance['end_op'] >= len(model.ops):
+        raise ConversionError('entry override has no resume boundary')
+    boundary = model.ops[instance['end_op']]
+    if not isinstance(boundary, VectorOp) or boundary.label != rule['boundary_label'] or boundary.values[index] != rule['boundary_ni_state']:
+        raise ConversionError('entry override resume boundary mismatch')
+    for cycle, op in enumerate(selected, instance['start_cycle']):
+        op.values[index] = rule['replacement_ni_state']
+        model.diagnostics.append({'kind': 'project_entry_override', 'cycle': cycle, 'pin': rule['pin'],
+            'original': rule['expected_ni_state'], 'replacement': rule['replacement_ni_state'], 'basis': rule['basis']})
+
+
+def _write_manifest(model: Model, files: dict[str, Path]) -> None:
+    from . import __version__
+
+    config = {'project_profile': model.project_profile, 'fixed_policy': model.fixed_policy,
+              'high_z_policy': model.high_z_policy, 'time_scale': str(model.time_scale), 'pins': model.pins,
+              'labels': next((item for item in model.diagnostics if item['kind'] == 'label_policy'), {})}
+    manifest = {
+        'converter_version': __version__, 'frontend': 'direct_stil_supported_subset',
+        'source': {'path': str(model.source), 'sha256': _sha256(model.source)},
+        'config': config,
+        'config_sha256': hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),
+        'script_sha256': {p.name: _sha256(p) for p in (Path(__file__), Path(__file__).with_name('profiles.py'))},
+        'cycles': sum(op.cycles for op in model.ops), 'source_reported_cycles': model.expected_cycles,
+        'invocations': [{key: value for key, value in invocation.items() if key not in ('start_op', 'end_op')}
+                        for invocation in model.invocations],
+        'pin_projection': {'retained': model.pins, 'omitted': model.omitted_pins,
+                           'omitted_pin_station_implementation': 'unknown'},
+        'validation': {'generation_ok': True, 'compile_ok': 'unknown', 'readback_ok': 'unknown',
+                       'station_editor_load_ok': 'unknown', 'station_driver_load_ok': 'unknown',
+                       'hardware_burst_result': 'unknown', 'high_z_electrical_equivalence': 'unknown'},
+        'scope': 'Projected pins under the declared Fixed, high-Z, entry and timing policies; not hardware equivalence.',
+        'files': {kind: {'path': path.name, 'bytes': path.stat().st_size, 'sha256': _sha256(path)}
+                  for kind, path in files.items() if kind != 'manifest'},
+    }
+    files['manifest'].write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+
+
+def _write_macro_timeline(model: Model, path: Path) -> None:
+    with path.open('w', encoding='utf-8-sig', newline='') as stream:
+        writer = csv.writer(stream)
+        writer.writerow(['cycle_0based', 'macro', 'invocation_index', 'source_line', 'timeset', 'period_ns', *model.pins])
+        cycle = 0
+        for op in model.ops:
+            if isinstance(op, VectorOp) and op.origin.get('scope') == 'macro':
+                wft = model.timeset_meta[op.timeset][0]
+                writer.writerow([cycle, op.origin['name'], op.origin['invocation_index'],
+                    op.origin.get('definition_line'), op.timeset, model.periods_ns[wft] * model.time_scale, *op.values])
+            cycle += op.cycles
+
+
 def _finish_with_halt(model: Model) -> None:
     if not model.ops:
         raise ConversionError("pattern generated no operations")
@@ -633,15 +833,48 @@ def _finish_with_halt(model: Model) -> None:
     if isinstance(last, VectorOp):
         last.opcode = "halt"
         return
-    if last.count < 2:
-        raise ConversionError("cannot split final one-cycle scan into scan plus halt")
     sequences = last.sequences.copy()
-    last.count -= 1
-    last.sequences = {pin: value[:-1] for pin, value in sequences.items()}
     values = last.base_values[:]
     for pin, sequence in sequences.items():
         values[model.pins.index(pin)] = sequence[-1]
-    model.ops.append(VectorOp(last.timeset, values, opcode="halt"))
+    if last.count == 1:
+        model.ops[-1] = VectorOp(last.timeset, values, label=last.label, opcode="halt")
+    else:
+        last.count -= 1
+        last.sequences = {pin: value[:-1] for pin, value in sequences.items()}
+        model.ops.append(VectorOp(last.timeset, values, opcode="halt"))
+
+
+def _lower_scan_states(model: Model) -> None:
+    """Split out states not representable in NI scan strings, without extra clocks."""
+    result: list[VectorOp | ScanOp] = []
+    inputs = {chain.scan_in for chain in model.scan_chains}
+    for op in model.ops:
+        if isinstance(op, VectorOp):
+            result.append(op)
+            continue
+        unsafe: set[int] = set()
+        for pin, data in op.sequences.items():
+            unsafe.update(match.start() for match in re.finditer('[^01]' if pin in inputs else '[^HLX]', data))
+        if not unsafe:
+            result.append(op)
+            continue
+        first = len(result)
+        position = 0
+        for index in sorted(unsafe):
+            if position < index:
+                result.append(ScanOp(op.timeset, index - position, op.base_values[:],
+                    {pin: data[position:index] for pin, data in op.sequences.items()}))
+            values = op.base_values[:]
+            for pin, data in op.sequences.items():
+                values[model.pins.index(pin)] = data[index]
+            result.append(VectorOp(op.timeset, values))
+            position = index + 1
+        if position < op.count:
+            result.append(ScanOp(op.timeset, op.count - position, op.base_values[:],
+                {pin: data[position:] for pin, data in op.sequences.items()}))
+        result[first].label = op.label
+    model.ops = result
 
 
 def _collect_timesets(model: Model) -> None:
@@ -659,7 +892,7 @@ def _required_pin_roles(model: Model) -> dict[str, list[str]]:
         roles.setdefault(chain.scan_out, []).append(f"ScanOut: {chain.name}")
         if chain.master_clock:
             roles.setdefault(chain.master_clock, []).append(f"ScanClock: {chain.name}")
-    for pin in model.pulse_edges:
+    for _, pin in model.pulse_edges:
         roles.setdefault(pin, []).append("P waveform")
     return roles
 
@@ -674,6 +907,8 @@ def _select_pins(model: Model, selected_pins: Iterable[str] | None) -> None:
     if unknown:
         raise ConversionError(f"selected pins do not exist in STIL: {sorted(unknown)}")
     required = set(_required_pin_roles(model))
+    if model.project_profile.get('entry'):
+        required.add(model.project_profile['entry']['pin'])
     missing = required - requested
     if missing:
         raise ConversionError(f"required scan/clock pins cannot be omitted: {sorted(missing)}")
@@ -683,7 +918,6 @@ def _select_pins(model: Model, selected_pins: Iterable[str] | None) -> None:
     model.pins = [original_pins[index] for index in indexes]
     model.omitted_pins = [pin for pin in original_pins if pin not in requested]
     model.directions = {pin: model.directions[pin] for pin in model.pins}
-    model.pulse_edges = {pin: edge for pin, edge in model.pulse_edges.items() if pin in requested}
     for op in model.ops:
         if isinstance(op, ScanOp):
             op.base_values[:] = [op.base_values[index] for index in indexes]
@@ -691,7 +925,7 @@ def _select_pins(model: Model, selected_pins: Iterable[str] | None) -> None:
             op.values[:] = [op.values[index] for index in indexes]
 
 
-def _write_pattern(model: Model, path: Path) -> None:
+def _write_pattern(model: Model, path: Path, progress=None) -> None:
     with path.open("w", encoding="utf-8", newline="\n") as out:
         out.write("// Generated by stil-to-ni-digital.\n")
         out.write("file_format_version 1.1;\n")
@@ -699,7 +933,9 @@ def _write_pattern(model: Model, path: Path) -> None:
         out.write(f"scan_in {', '.join(chain.scan_in for chain in model.scan_chains)};\n")
         out.write(f"scan_out {', '.join(chain.scan_out for chain in model.scan_chains)};\n\n")
         out.write(f"pattern {model.pattern_name} ({', '.join(model.pins)})\n{{\n")
-        for op in model.ops:
+        for index, op in enumerate(model.ops):
+            if progress:
+                progress(60 + 14 * index // len(model.ops), '写入压缩 Pattern')
             if op.label:
                 out.write(f"{op.label}:\n")
             if isinstance(op, VectorOp):
@@ -715,8 +951,9 @@ def _write_pattern(model: Model, path: Path) -> None:
         out.write("}\n")
 
 
-def _write_expanded_pattern(model: Model, path: Path) -> int:
+def _write_expanded_pattern(model: Model, path: Path, progress=None) -> int:
     count = 0
+    total = sum(op.cycles for op in model.ops)
     with path.open("w", encoding="utf-8", newline="\n", buffering=1024 * 1024) as out:
         out.write("// Generated by stil-to-ni-digital; one vector per test cycle.\n")
         out.write("file_format_version 1.1;\n")
@@ -741,16 +978,20 @@ def _write_expanded_pattern(model: Model, path: Path) -> int:
                     if len(chunk) >= 10000:
                         out.writelines(chunk)
                         chunk.clear()
+                        if progress:
+                            progress(75 + 19 * count // total, '写入展开 Pattern')
             if len(chunk) >= 10000:
                 out.writelines(chunk)
                 chunk.clear()
+                if progress:
+                    progress(75 + 19 * count // total, '写入展开 Pattern')
         if chunk:
             out.writelines(chunk)
         out.write("}\n")
     return count
 
 
-def _pin_edge(pin: str, period: float, compare: float, pulse: tuple[str, float, float] | None) -> str:
+def _pin_edge(pin: str, period: Decimal, compare: Decimal, pulse: tuple[str, Decimal, Decimal] | None) -> str:
     lines = [f'          <PinEdge pin="{escape(pin)}">']
     if pulse:
         mode, data, ret = pulse
@@ -786,10 +1027,14 @@ def _write_timing(model: Model, path: Path) -> None:
     ]
     for timeset in model.used_timesets:
         wft, pulse_pins = model.timeset_meta[timeset]
-        period = model.periods_ns[wft]
+        period = model.periods_ns[wft] * model.time_scale
         lines += [f'      <TimeSet name="{escape(timeset)}">', f"        <Period>{_fmt_ns(period)}</Period>", "        <PinEdges>"]
         for pin in model.pins:
-            lines.append(_pin_edge(pin, period, model.compare_ns, model.pulse_edges.get(pin) if pin in pulse_pins else None))
+            pulse = model.pulse_edges.get((wft, pin)) if pin in pulse_pins else None
+            if pulse:
+                pulse = (pulse[0], pulse[1] * model.time_scale, pulse[2] * model.time_scale)
+            compare = model.compare_edges.get((wft, pin), Decimal(0)) * model.time_scale
+            lines.append(_pin_edge(pin, period, compare, pulse))
         lines += ["        </PinEdges>", "      </TimeSet>"]
     lines += ["    </TimeSets>", "  </TimingSheet>", "</TimingFile>", ""]
     path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
@@ -825,6 +1070,11 @@ def _write_report(model: Model, files: dict[str, Path], path: Path) -> None:
         ],
         f"Generated test cycles: {cycles}",
         f"Source-reported test cycles: {model.expected_cycles}",
+        f"Project profile: {model.project_profile.get('name', '(none)')}",
+        f"Fixed conflict policy: {model.fixed_policy}",
+        f"Compare-high-Z policy: {model.high_z_policy}; electrical equivalence: unknown",
+        f"Time scale: {model.time_scale}",
+        f"Diagnostics: {len(model.diagnostics)} (see source_semantics_report.json)",
         f"NI vector instructions: {sum(isinstance(op, VectorOp) for op in model.ops)}",
         f"NI scan instructions: {sum(isinstance(op, ScanOp) for op in model.ops)}", "",
         "Station configuration required:",
@@ -842,7 +1092,7 @@ def inspect_file(source: Path) -> StilInspection:
     source = source.expanduser().resolve()
     if not source.is_file():
         raise ConversionError(f"input file does not exist: {source}")
-    text = _read_text(source)
+    text = _strip_comments(_read_text(source))
     model = Model(source, source.parent)
     _parse_signals_groups(text, model)
     _parse_timing(text, model)
@@ -870,26 +1120,88 @@ def convert_file(
     output_dir: Path,
     *,
     expand_scan: bool = False,
-    keep_labels: bool = True,
+    keep_labels: bool | None = None,
     selected_pins: Iterable[str] | None = None,
+    project_profile: str | None = None,
+    fixed_policy: str = "error",
+    high_z_policy: str = "error",
+    time_scale: str = "1",
+    progress=None,
 ) -> ConversionResult:
+    from .progress import Progress
+
+    report_progress = Progress(progress)
+    report_progress(0, '读取 STIL')
     source = source.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
     if not source.is_file():
         raise ConversionError(f"input file does not exist: {source}")
-    text = _read_text(source)
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise ConversionError(f"output directory must be empty: {output_dir}")
+    raw_text = _read_text(source)
+    report_progress(8, '处理注释')
+    text = _strip_comments(raw_text)
+    report_progress(12, '解析引脚和时序')
     model = Model(source, output_dir)
+    if project_profile:
+        if project_profile not in PROFILES:
+            raise ConversionError(f"unknown project profile: {project_profile}")
+        model.project_profile = PROFILES[project_profile]
+        if _sha256(source) != model.project_profile['source_sha256']:
+            raise ConversionError('project profile source SHA-256 mismatch; review the new input before applying overrides')
+        fixed_policy = model.project_profile['fixed_policy']
+        high_z_policy = model.project_profile['high_z_policy']
+        if selected_pins is None:
+            selected_pins = model.project_profile['pins']
+    if fixed_policy not in ('error', 'preserve_fixed_with_diagnostic'):
+        raise ConversionError(f"invalid Fixed policy: {fixed_policy}")
+    if high_z_policy not in ('error', 'midband'):
+        raise ConversionError(f"invalid high-Z policy: {high_z_policy}")
+    model.fixed_policy, model.high_z_policy = fixed_policy, high_z_policy
+    try:
+        model.time_scale = Decimal(str(time_scale))
+    except InvalidOperation as exc:
+        raise ConversionError('time_scale must be a positive finite decimal') from exc
+    if not model.time_scale.is_finite() or model.time_scale <= 0:
+        raise ConversionError('time_scale must be a positive finite decimal')
     _parse_signals_groups(text, model)
     _parse_timing(text, model)
     _parse_scan(text, model)
+    report_progress(18, '解析过程定义')
     _parse_definitions(text, model)
-    _parse_pattern(text, model, keep_labels)
+    _parse_pattern(text, model, True, report_progress)
+    report_progress(55, '校验周期和标签')
+    summary = re.search(r"Patterns reference\s+(\d+)\s+V statements, generating\s+(\d+)\s+test cycles", raw_text)
+    if summary:
+        model.expected_v_statements, model.expected_cycles = map(int, summary.groups())
+    _apply_project_entry(model)
+    label_count = sum(op.label is not None for op in model.ops)
+    if keep_labels is True and label_count > 8191:
+        raise ConversionError(
+            f"{label_count} vector labels exceed NI limit 8191; use automatic labels or --no-labels"
+        )
+    label_index = []
+    label_cycle = 0
+    for op in model.ops:
+        if op.label:
+            label_index.append((op.label, label_cycle))
+        label_cycle += op.cycles
+    omit_labels = keep_labels is False or (keep_labels is None and label_count > 8191)
+    if omit_labels:
+        for op in model.ops:
+            op.label = None
+    model.diagnostics.append({
+        'kind': 'label_policy', 'policy': 'auto' if keep_labels is None else ('keep' if keep_labels else 'omit'),
+        'source_label_count': label_count, 'emitted_label_count': 0 if omit_labels else label_count,
+        'index': 'pattern_labels.csv',
+    })
 
     cycles = sum(op.cycles for op in model.ops)
     if model.expected_cycles is not None and cycles != model.expected_cycles:
         raise ConversionError(
             f"generated cycle count {cycles} differs from STIL summary {model.expected_cycles}"
         )
+    _lower_scan_states(model)
     _finish_with_halt(model)
     if sum(op.cycles for op in model.ops) != cycles:
         raise AssertionError("halt conversion changed the cycle count")
@@ -903,17 +1215,33 @@ def convert_file(
         "timing": output_dir / f"{base}.digitiming",
         "pinmap": output_dir / f"{base}.pinmap",
         "report": output_dir / "conversion_report.txt",
+        "manifest": output_dir / "build_manifest.json",
+        "diagnostics": output_dir / "source_semantics_report.json",
+        "macro_timeline": output_dir / "macro_timeline.csv",
+        "label_index": output_dir / "pattern_labels.csv",
     }
-    _write_pattern(model, files["pattern_source"])
+    with files['label_index'].open('w', encoding='utf-8', newline='') as stream:
+        writer = csv.writer(stream)
+        writer.writerow(['label', 'execution_cycle_0based'])
+        writer.writerows(label_index)
+    _write_pattern(model, files["pattern_source"], report_progress)
+    report_progress(74, '写入时序和引脚映射')
     _write_timing(model, files["timing"])
     _write_pinmap(model, files["pinmap"])
     if expand_scan:
+        report_progress(75, '写入展开 Pattern')
         expanded = output_dir / f"{base}.expanded.digipatsrc"
-        expanded_count = _write_expanded_pattern(model, expanded)
+        expanded_count = _write_expanded_pattern(model, expanded, report_progress)
         if expanded_count != cycles:
             raise AssertionError("expanded vector count differs from the STIL cycle count")
         files["expanded_pattern_source"] = expanded
+    report_progress(95, '写入诊断和周期索引')
+    files['diagnostics'].write_text(json.dumps(model.diagnostics, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    _write_macro_timeline(model, files['macro_timeline'])
+    report_progress(97, '计算文件校验值和报告')
     _write_report(model, files, files["report"])
+    _write_manifest(model, files)
+    report_progress(100, '转换完成')
 
     return ConversionResult(
         files=files,

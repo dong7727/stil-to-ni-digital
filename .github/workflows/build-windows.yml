@@ -23,8 +23,12 @@ jobs:
       - name: Smoke test executable
         shell: pwsh
         run: |
+          python scripts/verify_packaged.py
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged source verification failed"
+          }
           $exe = ".\packaging\dist\STIL-to-NI-Digital.exe"
-          $smoke = Start-Process -FilePath $exe -ArgumentList "--self-test" -PassThru
+          $smoke = Start-Process -FilePath $exe -ArgumentList "--self-test" -PassThru -WindowStyle Hidden
           try {
             $smoke | Wait-Process -Timeout 60 -ErrorAction Stop
           }

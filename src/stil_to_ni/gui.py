@@ -10,17 +10,20 @@ from PySide6.QtGui import QCloseEvent, QDesktopServices, QDragEnterEvent, QDropE
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QHeaderView,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
@@ -31,6 +34,7 @@ from PySide6.QtWidgets import (
 from . import __version__
 from .compiler import compile_pattern, find_compiler
 from .converter import ConversionError, ConversionResult, StilInspection, convert_file, inspect_file
+from .profiles import PROFILES
 
 
 def _suggest_output(source: Path) -> Path:
@@ -109,6 +113,7 @@ class InspectionWorker(QObject):
 
 class ConversionWorker(QObject):
     log = Signal(str)
+    progress = Signal(int, str)
     succeeded = Signal(object, str)
     failed = Signal(str)
     finished = Signal()
@@ -120,6 +125,9 @@ class ConversionWorker(QObject):
         expand: bool,
         should_compile: bool,
         selected_pins: tuple[str, ...],
+        project_profile: str | None = None,
+        time_scale: str = '1',
+        keep_labels: bool | None = None,
     ) -> None:
         super().__init__()
         self.source = source
@@ -127,6 +135,9 @@ class ConversionWorker(QObject):
         self.expand = expand
         self.should_compile = should_compile
         self.selected_pins = selected_pins
+        self.project_profile = project_profile
+        self.time_scale = time_scale
+        self.keep_labels = keep_labels
 
     @Slot()
     def run(self) -> None:
@@ -137,6 +148,11 @@ class ConversionWorker(QObject):
                 self.output,
                 expand_scan=self.expand,
                 selected_pins=self.selected_pins,
+                project_profile=self.project_profile,
+                time_scale=self.time_scale,
+                keep_labels=self.keep_labels,
+                progress=lambda percent, stage: self.progress.emit(
+                    percent * 70 // 100 if self.should_compile else percent, stage),
             )
             self.log.emit(f"解析完成：{result.cycles:,} 个测试周期，{len(result.pins)} 个引脚")
             for kind, path in result.files.items():
@@ -147,10 +163,15 @@ class ConversionWorker(QObject):
                 expanded = result.files.get("expanded_pattern_source")
                 if expanded is not None:
                     sources.append(expanded)
-                for pattern_source in sources:
+                for index, pattern_source in enumerate(sources):
                     self.log.emit(f"正在使用 NI 编译器处理：{pattern_source.name}")
                     compiled = pattern_source.with_suffix(".digipat")
-                    completed = compile_pattern(pattern_source, result.files["pinmap"], compiled)
+                    completed = compile_pattern(
+                        pattern_source, result.files["pinmap"], compiled,
+                        progress=lambda percent, stage: self.progress.emit(
+                            70 + (index * 100 + percent) * 30 // (len(sources) * 100),
+                            f'{stage} [{index + 1}/{len(sources)}]'),
+                    )
                     detail = "\n".join(
                         part.strip() for part in (completed.stdout, completed.stderr) if part.strip()
                     )
@@ -194,8 +215,13 @@ class ConverterWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         central = QWidget()
-        self.setCentralWidget(central)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(central)
+        self.setCentralWidget(scroll)
         outer = QVBoxLayout(central)
+        outer.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         outer.setContentsMargins(30, 24, 30, 24)
         outer.setSpacing(14)
 
@@ -277,6 +303,22 @@ class ConverterWindow(QMainWindow):
         output_row.addWidget(self.output_edit, 1)
         output_row.addWidget(self.output_button)
         options_layout.addLayout(output_row)
+        policy_row = QHBoxLayout()
+        self.profile_combo = QComboBox()
+        self.profile_combo.addItem('通用严格模式', None)
+        self.profile_combo.addItem('P2506 已确认入口配置（固定 17 引脚）', 'p2506-20261014')
+        policy_row.addWidget(self.profile_combo, 1)
+        policy_row.addWidget(QLabel('时间倍率'))
+        self.time_scale_edit = QLineEdit('1')
+        self.time_scale_edit.setMaximumWidth(80)
+        policy_row.addWidget(self.time_scale_edit)
+        options_layout.addLayout(policy_row)
+        self.labels_combo = QComboBox()
+        self.labels_combo.addItem('标签：自动（超过 8191 时省略）', None)
+        self.labels_combo.addItem('标签：不生成定位标签', False)
+        self.labels_combo.addItem('标签：全部保留（最多 8191）', True)
+        options_layout.addWidget(self.labels_combo)
+        options_layout.addWidget(self._hint('P2506 配置校验源文件哈希，仅初始化 186 周期拉低 NRST；保留 Fixed，T→M 电气等价仍待上机验证。输出目录须为空。'))
         self.expand_check = QCheckBox("完全展开扫描周期（每个测试周期一行，文件可能很大）")
         self.expand_check.setChecked(True)
         self.compile_check = QCheckBox("调用 NI Digital Pattern Compiler，同时生成 .digipat")
@@ -421,6 +463,8 @@ class ConverterWindow(QMainWindow):
         self.running = True
         self._set_controls(False)
         self.status_label.setText("正在解析 STIL…")
+        self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
         self.progress.show()
         self._append_log("正在解析引脚、Timing 和 ScanChain……")
 
@@ -557,15 +601,8 @@ class ConverterWindow(QMainWindow):
             QMessageBox.critical(self, "输出错误", f"无法访问输出目录：{exc}")
             return
         if output_has_files:
-            answer = QMessageBox.question(
-                self,
-                "输出目录非空",
-                "输出目录中已有文件，同名转换结果将被覆盖。是否继续？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
+            QMessageBox.critical(self, '输出目录非空', '请选择新的空目录，以保留每次构建的文件和验证记录。')
+            return
         if self.compile_check.isChecked():
             try:
                 find_compiler()
@@ -583,8 +620,16 @@ class ConverterWindow(QMainWindow):
         self._append_log(f"完全展开：{'是' if self.expand_check.isChecked() else '否'}")
         self._append_log(f"编译 digipat：{'是' if self.compile_check.isChecked() else '否'}")
         selected_pins = self._selected_pins()
+        profile = self.profile_combo.currentData()
+        if profile:
+            selected_pins = tuple(PROFILES[profile]['pins'])
+        self._append_log(f"项目配置：{profile or '通用严格模式'}；时间倍率：{self.time_scale_edit.text()}")
         self._append_log(f"转换引脚：{len(selected_pins)}/{len(self.inspection.pins)}")
         self.status_label.setText("正在转换…")
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(True)
+        self.progress.setFormat('%p%')
         self.progress.show()
 
         self.thread = QThread(self)
@@ -594,10 +639,14 @@ class ConverterWindow(QMainWindow):
             self.expand_check.isChecked(),
             self.compile_check.isChecked(),
             selected_pins,
+            profile,
+            self.time_scale_edit.text().strip(),
+            self.labels_combo.currentData(),
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.log.connect(self._append_log)
+        self.worker.progress.connect(self._update_progress)
         self.worker.succeeded.connect(self._finish_success)
         self.worker.failed.connect(self._finish_error)
         self.worker.finished.connect(self.thread.quit)
@@ -605,14 +654,19 @@ class ConverterWindow(QMainWindow):
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
 
+    @Slot(int, str)
+    def _update_progress(self, percent: int, stage: str) -> None:
+        self.progress.setValue(percent)
+        self.status_label.setText(f'{percent}% · {stage}')
+
     @Slot(object, str)
     def _finish_success(self, result: ConversionResult, output_text: str) -> None:
         self.running = False
         self.last_output = Path(output_text)
-        self.progress.hide()
+        self.progress.setValue(100)
         self._set_controls(True)
         self.open_button.setEnabled(True)
-        self.status_label.setText("转换完成")
+        self.status_label.setText("100% · 转换完成")
         self._append_log(f"完成：共 {result.cycles:,} 个测试周期。")
         QMessageBox.information(
             self,
@@ -623,7 +677,6 @@ class ConverterWindow(QMainWindow):
     @Slot(str)
     def _finish_error(self, detail: str) -> None:
         self.running = False
-        self.progress.hide()
         self._set_controls(True)
         self.status_label.setText("转换失败")
         self._append_log(f"错误：{detail}")
@@ -637,6 +690,9 @@ class ConverterWindow(QMainWindow):
             self.output_edit,
             self.output_button,
             self.expand_check,
+            self.profile_combo,
+            self.time_scale_edit,
+            self.labels_combo,
             self.drop_area,
         ):
             widget.setEnabled(enabled)

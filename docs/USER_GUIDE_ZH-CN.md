@@ -1,6 +1,16 @@
 # STIL to NI-Digital 中文使用手册
 
-本文档适用于 `STIL to NI-Digital v0.3.0`。软件用于将常见的、面向扫描测试的 Synopsys TetraMAX STIL 文件转换为 NI Digital Pattern Editor / NI PXI Digital Pattern Instrument 可继续处理的文件。
+本文档适用于 `STIL to NI-Digital v0.4.1`。软件用于将常见的、面向扫描测试的 Synopsys TetraMAX STIL 文件转换为 NI Digital Pattern Editor / NI PXI Digital Pattern Instrument 可继续处理的文件。
+
+### v0.4.1：标签限制与进度
+
+桌面端默认使用“标签：自动”。当定位标签超过 NI 编译器的 8191 个上限时，输出自动省略这些标签，避免 `Vector label ... exceeds the allowed limit of 8191`。受支持的 Pattern 按顺序执行，去掉定位标签不改变向量、扫描数据、时序或周期数；不支持的跳转仍会报错。需要从某个标签启动的外部测试流程，应明确选择保留标签并遵守数量限制。
+
+每次转换都会生成 `pattern_labels.csv`，记录标签与从 0 开始的执行周期，便于定位。也可选择“不生成定位标签”；选择“全部保留”且超限时，会在写文件前停止。命令行默认也是自动策略，`--no-labels` 强制省略，`--keep-labels` 强制保留。
+
+进度条显示整体阶段百分比，覆盖解析、压缩/展开写入、编译和反编译校验。它按阶段和实际解析/写入数量计算，不代表剩余时间。启用编译时，转换占前 70%，编译与校验占后 30%；NI 编译器没有内部百分比接口，运行期间百分比停在当前阶段，状态显示“编译中”或“反编译校验中”。只有全部请求的处理成功后才显示 100%。命令行加 `--progress` 可输出同样的进度。
+
+本次 PWD、短链补位和 capture 修复的使用方法及验证范围见 [2026-10-14 维护说明](MAINTENANCE_20261014.md)。桌面端可显式选择 P2506 配置和时间倍率；通用模式默认对 Fixed 冲突及未配置的高阻比较报错。
 
 > [!IMPORTANT]
 > 本工具不是完整的 IEEE 1450 STIL 解析器。它只转换项目明确支持的 STIL 子集；遇到无法可靠转换的结构时会停止并报错，不会故意静默改变测试语义。
@@ -107,7 +117,7 @@ D:\patterns\device_scan_NI_Output
 
 可以直接使用自动建议的目录，也可以点击“输出目录…”选择其他文件夹。
 
-如果目录不存在，程序会自动创建。如果目录已经包含文件，程序会提示确认；继续后，同名结果文件会被覆盖，其他不同名文件不会被删除。
+如果目录不存在，程序会自动创建。如果目录已经包含文件，程序会要求选择新的空目录，以保留每次构建的文件和验证记录。
 
 建议每个 STIL 文件使用独立的空目录，便于核对结果和保存转换记录。
 
@@ -200,8 +210,9 @@ device_scan.stil
 
 对较短扫描链，转换器会：
 
-- 在 ScanIn 数据前补一个填充值。该位会在后续有效位全部移入后被推出，不改变最终装载内容。
-- 在 ScanOut 数据后补一个 `X`。较短链的有效比较结束后不再比较，避免产生假失败。
+- 在 ScanIn 数据前补移位前上下文中的状态，不再复制首个有效位。
+- 在 ScanOut 数据后补上下文中的状态；本项目常见为 X，但不会一律强制为 X。缺失整个参数时，在全部移位周期保持对应上下文。
+- NI scan 输入串仅允许 0/1，X 补位周期自动拆为普通向量；其余可表示的数据段保留 scan 压缩。拆分不增加时钟周期。
 
 每条链原始长度、ScanIn、ScanOut、`ScanInversion` 和 `ScanMasterClock` 都会写入 `conversion_report.txt`。转换器不会再次翻转 ScanIn/ScanOut 字符串，因为 STIL Call 中的数据已经是外部扫描引脚上的波形值。
 
@@ -324,7 +335,7 @@ STIL 中同一个 waveform character 可能在不同引脚上代表不同边沿�
 
 ### 7.5 提示输出目录非空
 
-程序检测到目录中已有文件。同名结果会被覆盖。若目录中包含需要保留的旧版本，请选择“否”，然后换一个新目录。
+程序检测到目录中已有文件。请换一个新的空目录，旧构建不会被覆盖。
 
 ### 7.6 提示生成周期数与 STIL 摘要不一致
 
@@ -366,7 +377,7 @@ ScanIn、ScanOut、ScanMasterClock 和使用 `P` waveform 的引脚是扫描执�
 
 ### 8.2 当前已支持
 
-v0.3.0 支持：
+v0.4.1 支持：
 
 - `Signals` 中的标量 `In`、`Out` 和 `InOut` 引脚
 - 使用 `+` 连接的有序 `SignalGroups`
@@ -376,9 +387,9 @@ v0.3.0 支持：
 - 多条并行 `ScanChain`，包括长度不相同的扫描链
 - `Procedures`、`MacroDefs`、`W`、`C`、`V`、`Call`、`Macro` 和 `Shift`
 - TetraMAX `#` 参数替换
-- TetraMAX `\r` 重复和 `\j` 紧凑 WFC 写法
-- `F` 状态赋值
-- compare-valid `T`，转换为 NI `V`
+- TetraMAX `\r` 重复及已展平单平面值的前置 `\j` 标记；嵌入 join、多平面 WFCMap 求值不支持
+- 过程作用域内的 `F` 约束，默认冲突报错；显式策略可保留 Fixed 并输出诊断
+- 按波形事件映射：比较 T 为高阻，需显式策略才能生成 NI M；比较 V 才是 NI V
 - 可选的 TetraMAX 周期摘要校验
 
 ### 8.3 当前尚未支持
@@ -476,6 +487,8 @@ stil-to-ni input.stil -o output --pins PA0,PA1,PA2 --pins PA3,PA4,PA5,PA7,PA8,PA
 ```text
 --expand-scan     额外生成每周期一条 vector 的展开版
 --no-labels       不在输出 Pattern 中保留 STIL Call 标签
+--keep-labels     保留全部定位标签；超过 8191 个时停止
+--progress        输出整体阶段进度百分比
 --compile         调用 NI 编译器生成 .digipat
 --pins P1,P2      只输出指定引脚；必需扫描脚和时钟脚不能省略
 --compiler PATH   显式指定 DigitalPatternCompiler.exe

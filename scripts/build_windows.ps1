@@ -19,7 +19,11 @@ finally {
 }
 
 $builtExe = Join-Path $projectRoot "packaging\dist\STIL-to-NI-Digital.exe"
-$smoke = Start-Process -FilePath $builtExe -ArgumentList "--self-test" -PassThru
+& $pythonExe (Join-Path $PSScriptRoot "verify_packaged.py")
+if ($LASTEXITCODE -ne 0) {
+    throw "Packaged source verification failed"
+}
+$smoke = Start-Process -FilePath $builtExe -ArgumentList "--self-test" -PassThru -WindowStyle Hidden
 try {
     $smoke | Wait-Process -Timeout 60 -ErrorAction Stop
 }

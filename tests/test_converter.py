@@ -57,15 +57,15 @@ class ConverterTests(unittest.TestCase):
 
     def test_multiple_unequal_scan_chains(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            result = convert_file(MULTI_FIXTURE, Path(directory), expand_scan=True)
+            result = convert_file(MULTI_FIXTURE, Path(directory), expand_scan=True, high_z_policy='midband')
             self.assertEqual(result.cycles, 16)
             self.assertEqual(result.scan_instructions, 3)
             source = result.files["pattern_source"].read_text(encoding="utf-8")
             self.assertIn("scan_in SI0, SI1;", source)
             self.assertIn("scan_out SO0, SO1;", source)
-            self.assertIn("SI1 1101;", source)
+            self.assertIn("SI1 0101;", source)
             self.assertIn("SO1 LHLX;", source)
-            self.assertIn("default_WFT_CLK_P 1 0 1 1 1 V V;", source)
+            self.assertIn("default_WFT_CLK_P 1 0 1 1 1 M M;", source)
             expanded = result.files["expanded_pattern_source"].read_text(encoding="utf-8")
             self.assertNotIn("scan(", expanded)
 
@@ -78,7 +78,7 @@ class ConverterTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             selected = ["CLK", "SI0", "SI1", "AUX", "SO0", "SO1"]
-            result = convert_file(MULTI_FIXTURE, Path(directory), selected_pins=selected)
+            result = convert_file(MULTI_FIXTURE, Path(directory), selected_pins=selected, high_z_policy='midband')
             self.assertEqual(result.pins, tuple(selected))
             source = result.files["pattern_source"].read_text(encoding="utf-8")
             timing = result.files["timing"].read_text(encoding="utf-8")
@@ -91,7 +91,7 @@ class ConverterTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ConversionError, "required scan/clock pins"):
-                convert_file(MULTI_FIXTURE, Path(directory), selected_pins=["CLK", "SI0"])
+                convert_file(MULTI_FIXTURE, Path(directory), selected_pins=["CLK", "SI0"], high_z_policy='midband')
 
 
 if __name__ == "__main__":

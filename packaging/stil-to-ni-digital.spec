@@ -8,7 +8,8 @@ python_abi_dll = Path(sys.base_prefix) / "python3.dll"
 
 analysis = Analysis(
     ["windows_entry.py"],
-    pathex=[],
+    # Always package this checkout, even if the build venv has an older wheel.
+    pathex=[str(Path(SPECPATH).parent / "src")],
     binaries=[(str(python_abi_dll), ".")],
     datas=[],
     hiddenimports=[],
